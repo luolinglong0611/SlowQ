@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slowq"
+version = "0.1.0"
+description = "慢炖 · SlowQ — Qwen3-0.6B CPU inference in readable Python + NumPy"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "SlowQ contributors" }]
+keywords = ["llm", "inference", "numpy", "qwen3", "cpu"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Intended Audience :: Developers",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "License :: OSI Approved :: MIT License",
+]
+
+# Runtime dependencies only. torch/transformers must never end up here.
+dependencies = [
+  "numpy>=1.26",
+  "tokenizers>=0.20",
+  "Jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+# Only needed by tools/validate_reference.py. Deliberately kept out of the
+# runtime import graph; see docs/architecture.md "Dependency boundaries".
+ref = [
+  "torch>=2.6",
+  "transformers==4.51.3",
+  "safetensors>=0.4",
+  "huggingface_hub>=0.25",
+]
+
+[project.scripts]
+slowq = "slowq.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/luolinglong0611/SlowQ"
+Repository = "https://github.com/luolinglong0611/SlowQ"
+Issues = "https://github.com/luolinglong0611/SlowQ/issues"
+
+[tool.setuptools]
+license-files = ["LICENSE"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+  "integration: real Qwen3-0.6B tests; skipped unless SLOWQ_MODEL_DIR points at a converted model directory",
+]
