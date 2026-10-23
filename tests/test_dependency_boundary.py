@@ -27,6 +27,7 @@ RUNTIME_MODULES = (
     "slowq.cache",
     "slowq.cli",
     "slowq.config",
+    "slowq.embedding",
     "slowq.engine",
     "slowq.errors",
     "slowq.metrics",
@@ -34,6 +35,7 @@ RUNTIME_MODULES = (
     "slowq.ops",
     "slowq.sampling",
     "slowq.tokenizer",
+    "slowq.vlm",
     "slowq.weights",
 )
 
@@ -49,6 +51,11 @@ FORBIDDEN = (
     "sentencepiece",
     "accelerate",
 )
+
+#: Pillow is an *optional* dependency (``slowq[vision]``). Importing the vision
+#: module must not import it — only actually reading an image may — or a
+#: text-only install would break on ``import slowq.vlm``.
+OPTIONAL = ("PIL",)
 
 PROBE = """
 import sys
@@ -73,6 +80,22 @@ def test_importing_the_runtime_does_not_pull_in_a_deep_learning_framework():
     )
     assert probe.returncode == 0, probe.stderr
     assert probe.stdout == "", f"the runtime imported: {probe.stdout.split(',')}"
+
+
+def test_importing_the_vision_module_does_not_require_pillow():
+    """A text-only environment must still be able to import every runtime module."""
+    probe = subprocess.run(
+        [sys.executable, "-c", PROBE.format(modules=RUNTIME_MODULES, forbidden=OPTIONAL)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert probe.returncode == 0, probe.stderr
+    assert probe.stdout == "", (
+        f"importing the runtime pulled in {probe.stdout.split(',')}, which is an "
+        "optional dependency; slowq.vlm must import it inside the function that "
+        "reads an image"
+    )
 
 
 def test_no_runtime_source_file_even_mentions_a_forbidden_import():
@@ -108,3 +131,15 @@ def test_the_reference_tools_are_an_optional_extra_not_a_runtime_requirement():
     assert any(requirement.startswith("transformers") for requirement in extras["ref"])
     # 'dev' must stay test-only; a torch dependency there would leak into CI.
     assert not any(requirement.split(">=")[0] in FORBIDDEN for requirement in extras["dev"])
+
+
+def test_pillow_is_an_optional_vision_extra_and_never_a_runtime_dependency():
+    """A text-only install must not be asked for an image library."""
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    runtime = [requirement.lower() for requirement in pyproject["project"]["dependencies"]]
+    assert not any(requirement.startswith("pillow") for requirement in runtime)
+    extras = pyproject["project"]["optional-dependencies"]
+    assert "vision" in extras
+    assert any(
+        requirement.lower().startswith("pillow") for requirement in extras["vision"]
+    ), extras["vision"]

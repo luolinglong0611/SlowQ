@@ -1,23 +1,43 @@
-"""Qwen3 forward pass: attention, MLP, decoder layer, full model.
+"""Text-decoder forward pass: attention, MLP, decoder layer, full model.
 
-Mirrors ``transformers`` 4.51.x ``models/qwen3/modeling_qwen3.py`` in eager
-attention mode, batch size 1, no dropout. Layer structure::
+One implementation covers the qwen3, qwen2 and llama families, because after
+checking each against its ``transformers`` 4.51.3 module the differences turn out
+to be flags rather than structure::
 
     residual = x
     x = residual + Attention(input_layernorm(x))
     residual = x
     x = residual + MLP(post_attention_layernorm(x))
 
+and the flags are:
+
+=====================  ==============================  ====================  =================
+                       qwen3                           qwen2                 llama
+=====================  ==============================  ====================  =================
+Q/K RMSNorm per head   yes                             no                    no
+q/k/v bias             ``config.attention_bias``       always                ``config.attention_bias``
+o_proj bias            ``config.attention_bias``       never                 ``config.attention_bias``
+MLP bias               never                           never                 ``config.mlp_bias``
+``head_dim``           explicit in config              ``hidden // heads``   ``hidden // heads``
+=====================  ==============================  ====================  =================
+
+Everything else — RMSNorm, RoPE, SwiGLU, GQA, the causal mask — is shared and was
+already verified identical across the three modules.
+
 Attention structure (the parts that are easy to get wrong)::
 
-    q = q_proj(x) -> [T, 16 * 128]   # 16 * 128 = 2048 != hidden_size 1024
-    k = k_proj(x) -> [T,  8 * 128]
-    v = v_proj(x) -> [T,  8 * 128]
-    q = q_norm(q)   # RMSNorm per head over head_dim, not over hidden_size
+    q = q_proj(x) [+ bias] -> [T, num_attention_heads * head_dim]
+    k = k_proj(x) [+ bias] -> [T, num_key_value_heads * head_dim]
+    v = v_proj(x) [+ bias]
+    q = q_norm(q)   # qwen3 only; RMSNorm per head over head_dim, not hidden_size
     k = k_norm(k)   # v is neither normed nor rotated
     q, k = rope(q, k, positions = offset .. offset + T - 1)
     scores = q @ repeat_kv(k).T * head_dim ** -0.5 + causal_mask(offset)
-    out = softmax(scores) @ repeat_kv(v) -> o_proj
+    out = softmax(scores) @ repeat_kv(v) -> o_proj [+ bias]
+
+Note that ``head_dim * num_attention_heads`` need not equal ``hidden_size``:
+Qwen3-0.6B has 16 * 128 = 2048 against a hidden_size of 1024, so the projection
+output is reshaped by ``head_dim`` and never assumed to be ``hidden_size``.
 
 See docs/architecture.md for the full shape table.
 """
@@ -32,8 +52,8 @@ from typing import Any, Iterable, Sequence
 import numpy as np
 
 from .cache import KVCache
-from .config import ModelConfig
-from .errors import ContextOverflowError, SlowQError
+from .config import TASK_TEXT_EMBEDDING, TASK_TEXT_GENERATION, ModelConfig
+from .errors import ConfigError, ContextOverflowError, SlowQError
 from .ops import (
     apply_rope,
     causal_attention_mask,
@@ -46,7 +66,11 @@ from .ops import (
     silu,
     split_heads,
 )
-from .weights import EMBEDDING_TENSOR_NAME, TIED_OUTPUT_EMBEDDING_ALIAS, Weights
+from .weights import (
+    Weights,
+    embedding_tensor_name,
+    output_embedding_name,
+)
 
 
 def resolve_probe_position(position: int, num_tokens: int) -> int:
@@ -85,6 +109,7 @@ class DebugProbe:
     ALL_CAPTURES = frozenset(
         {
             "embed",
+            "embed_sequence",
             "attention_output",
             "mlp_output",
             "layer_output",
@@ -127,13 +152,33 @@ class DebugProbe:
                 tensor[index], dtype=np.float32
             )
 
+    def record_sequence(self, name: str, tensor: np.ndarray) -> None:
+        """Store a whole ``[T, H]`` activation instead of selected positions.
+
+        Only ``embed_sequence`` uses it: the merged image+text embedding matrix is
+        the one activation where *which row got which value* is the thing under
+        test, so sampling positions would leave most of the merge unobserved. It
+        is a prefill-sized tensor, which is why it is opt-in by name.
+        """
+        self.records[name] = np.array(tensor, dtype=np.float32)
+
+
+@dataclass(frozen=True)
+class DecoderOutput:
+    """Output of the decoder stack alone: final-normed hidden states, no logits."""
+
+    hidden_states: np.ndarray
+    position_offset: int
+    num_tokens: int
+    cache_length: int
+
 
 @dataclass(frozen=True)
 class ForwardResult:
     """Output of one full model forward.
 
     ``logits`` covers only the last position (``[vocab_size]``): projecting the
-    whole sequence would build a ``[T, 151936]`` FP32 tensor and throw it away.
+    whole sequence would build a ``[T, vocab_size]`` FP32 tensor and throw it away.
     """
 
     logits: np.ndarray
@@ -143,8 +188,13 @@ class ForwardResult:
     cache_length: int
 
 
-class Qwen3Model:
-    """The complete Qwen3 causal LM over a converted weight directory."""
+class DecoderModel:
+    """The family-generic text decoder over a converted weight directory.
+
+    Runs the embedding table, every decoder layer and the final RMSNorm. The
+    output projection is a separate step because a text-embedding checkpoint has
+    no ``lm_head`` at all and must not be asked for one.
+    """
 
     def __init__(self, config: ModelConfig, weights: Weights) -> None:
         self.config = config
@@ -153,16 +203,10 @@ class Qwen3Model:
         self.inv_freq = rope_inv_freq(config.head_dim, config.rope_theta)
 
     @classmethod
-    def from_directory(cls, model_dir: str | Path) -> "Qwen3Model":
+    def from_directory(cls, model_dir: str | Path, task: str | None = None) -> "DecoderModel":
         """Low-level loader. ``slowq.Engine.from_directory`` is the friendlier one."""
-        root = Path(model_dir)
-        config_path = root / "config.json"
-        if not config_path.is_file():
-            raise SlowQError(
-                f"{config_path} not found; is this a converted SlowQ model directory?"
-            )
-        raw: dict[str, Any] = json.loads(config_path.read_text(encoding="utf-8"))
-        return cls(ModelConfig.from_hf_config(raw), Weights.from_directory(root))
+        config, weights = load_config_and_weights(model_dir, task)
+        return cls(config, weights)
 
     def new_cache(self, max_context: int) -> KVCache:
         self.config.validate_max_context(max_context)
@@ -178,7 +222,8 @@ class Qwen3Model:
     def embed(self, input_ids: np.ndarray) -> np.ndarray:
         """``[T] int`` -> ``[T, hidden_size]`` FP32."""
         table = self.weights.expect(
-            EMBEDDING_TENSOR_NAME, (self.config.vocab_size, self.config.hidden_size)
+            embedding_tensor_name(self.config),
+            (self.config.vocab_size, self.config.hidden_size),
         )
         ids = np.asarray(input_ids, dtype=np.int64).reshape(-1)
         if ids.size == 0:
@@ -192,24 +237,30 @@ class Qwen3Model:
         return np.array(table[ids], dtype=np.float32)
 
     def output_projection(self, hidden_last: np.ndarray) -> np.ndarray:
-        """``[hidden_size]`` -> ``[vocab_size]`` logits through the (tied) lm_head."""
-        name = (
-            EMBEDDING_TENSOR_NAME
-            if self.config.tie_word_embeddings
-            else TIED_OUTPUT_EMBEDDING_ALIAS
+        """``[hidden_size]`` -> ``[vocab_size]`` logits through the lm_head."""
+        if self.config.task == TASK_TEXT_EMBEDDING:
+            raise SlowQError(
+                f"task {self.config.task!r} produces a normalised hidden-state vector, "
+                "not a vocabulary distribution; this checkpoint has no lm_head to "
+                "project through. Use slowq.embedding.EmbeddingModel.encode instead."
+            )
+        name = output_embedding_name(self.config)
+        weight = self.weights.expect(
+            name, (self.config.vocab_size, self.config.hidden_size)
         )
-        weight = self.weights.expect(name, (self.config.vocab_size, self.config.hidden_size))
         hidden = np.asarray(hidden_last, dtype=np.float32).reshape(1, -1)
         return np.matmul(hidden, weight.T)[0]
 
-    def forward(
+    def encode(
         self,
         input_ids: Sequence[int] | np.ndarray,
         kv_cache: KVCache,
         position_offset: int | None = None,
         probe: DebugProbe | None = None,
-    ) -> ForwardResult:
-        """Run one forward over ``input_ids`` and append their K/V to ``kv_cache``.
+        inputs_embeds: np.ndarray | None = None,
+        inputs_embed_mask: np.ndarray | None = None,
+    ) -> DecoderOutput:
+        """Run the decoder stack over ``input_ids``, appending their K/V to the cache.
 
         ``position_offset`` defaults to ``kv_cache.length``. Passing it only lets
         a caller state the invariant they rely on; a value that disagrees with
@@ -219,7 +270,7 @@ class Qwen3Model:
         ids = np.asarray(input_ids, dtype=np.int64).reshape(-1)
         num_tokens = int(ids.shape[0])
         if num_tokens == 0:
-            raise ValueError("forward() needs at least one token")
+            raise ValueError("encode() needs at least one token")
 
         offset = kv_cache.length if position_offset is None else int(position_offset)
         if offset != kv_cache.length:
@@ -235,6 +286,12 @@ class Qwen3Model:
                 f"position {total_length - 1} exceeds max_position_embeddings="
                 f"{self.config.max_position_embeddings}"
             )
+        if self.config.sliding_window is not None and total_length > self.config.sliding_window:
+            raise ContextOverflowError(
+                f"position {total_length - 1} exceeds this checkpoint's "
+                f"sliding_window={self.config.sliding_window}; SlowQ implements full "
+                "attention only, and the reference would have masked those keys out."
+            )
 
         positions = np.arange(offset, total_length, dtype=np.int64)
         cos, sin = rope_cos_sin(positions, self.inv_freq)
@@ -247,8 +304,11 @@ class Qwen3Model:
                 resolve_probe_position(position, num_tokens)
 
         hidden = self.embed(ids)
+        hidden = self._merge_inputs_embeds(hidden, inputs_embeds, inputs_embed_mask, num_tokens)
         if probe is not None and probe.wants("embed"):
             probe.record("embed", hidden)
+        if probe is not None and probe.wants("embed_sequence"):
+            probe.record_sequence("embed_sequence", hidden)
 
         for layer_idx in range(self.config.num_hidden_layers):
             hidden = self._decoder_layer(
@@ -257,28 +317,101 @@ class Qwen3Model:
 
         hidden = rms_norm(
             hidden,
-            self.weights.expect("model.norm.weight", (self.config.hidden_size,)),
+            self.weights.expect(
+                f"{self.config.tensor_prefix}.norm.weight", (self.config.hidden_size,)
+            ),
             self.config.rms_norm_eps,
         )
         if probe is not None and probe.wants("final_norm"):
             probe.record("final_norm", hidden)
 
-        logits = self.output_projection(hidden[-1])
-        if probe is not None and probe.wants("logits"):
-            self._record_probe_logits(probe, hidden, logits)
-
         # Advance the length once, after every layer has written its own slots.
         kv_cache.commit(num_tokens)
 
-        return ForwardResult(
-            logits=logits,
+        return DecoderOutput(
             hidden_states=hidden,
             position_offset=offset,
             num_tokens=num_tokens,
             cache_length=kv_cache.length,
         )
 
+    def forward(
+        self,
+        input_ids: Sequence[int] | np.ndarray,
+        kv_cache: KVCache,
+        position_offset: int | None = None,
+        probe: DebugProbe | None = None,
+        inputs_embeds: np.ndarray | None = None,
+        inputs_embed_mask: np.ndarray | None = None,
+    ) -> ForwardResult:
+        """``encode`` plus the output projection of the block's last position."""
+        decoded = self.encode(
+            input_ids,
+            kv_cache,
+            position_offset=position_offset,
+            probe=probe,
+            inputs_embeds=inputs_embeds,
+            inputs_embed_mask=inputs_embed_mask,
+        )
+        logits = self.output_projection(decoded.hidden_states[-1])
+        if probe is not None and probe.wants("logits"):
+            self._record_probe_logits(probe, decoded.hidden_states, logits)
+        return ForwardResult(
+            logits=logits,
+            hidden_states=decoded.hidden_states,
+            position_offset=decoded.position_offset,
+            num_tokens=decoded.num_tokens,
+            cache_length=decoded.cache_length,
+        )
+
     # ---- internals ----------------------------------------------------------
+
+    def _merge_inputs_embeds(
+        self,
+        hidden: np.ndarray,
+        inputs_embeds: np.ndarray | None,
+        inputs_embed_mask: np.ndarray | None,
+        num_tokens: int,
+    ) -> np.ndarray:
+        """Scatter pre-computed embeddings over the placeholder positions.
+
+        The count is checked against the mask rather than trusted: a prompt whose
+        ``<image>`` expansion disagrees with what the vision tower produced must
+        fail here, loudly, instead of silently dropping image features or writing
+        them onto text tokens.
+        """
+        if inputs_embeds is None:
+            if inputs_embed_mask is not None and np.any(inputs_embed_mask):
+                raise ValueError(
+                    "inputs_embed_mask marks placeholder positions but no "
+                    "inputs_embeds were supplied"
+                )
+            return hidden
+        if inputs_embed_mask is None:
+            raise ValueError("inputs_embeds require an inputs_embed_mask")
+        mask = np.asarray(inputs_embed_mask, dtype=bool).reshape(-1)
+        if mask.shape[0] != num_tokens:
+            raise ValueError(
+                f"inputs_embed_mask covers {mask.shape[0]} positions but this "
+                f"forward has {num_tokens} tokens"
+            )
+        features = np.asarray(inputs_embeds, dtype=np.float32)
+        if features.ndim != 2 or features.shape[1] != self.config.hidden_size:
+            raise ValueError(
+                f"inputs_embeds must be [n, {self.config.hidden_size}], got "
+                f"{features.shape}"
+            )
+        selected = int(mask.sum())
+        if selected != features.shape[0]:
+            raise ValueError(
+                f"the prompt expands to {selected} placeholder tokens but the "
+                f"encoder produced {features.shape[0]} feature rows; the image "
+                "token count and the vision output disagree, so there is no "
+                "correct way to line them up"
+            )
+        hidden = hidden.copy()
+        hidden[mask] = features
+        return hidden
 
     def _record_probe_logits(
         self, probe: DebugProbe, hidden: np.ndarray, last_logits: np.ndarray
@@ -315,7 +448,7 @@ class Qwen3Model:
         probe: DebugProbe | None,
     ) -> np.ndarray:
         cfg = self.config
-        prefix = f"model.layers.{layer_idx}"
+        prefix = f"{cfg.tensor_prefix}.layers.{layer_idx}"
 
         residual = hidden
         normed = rms_norm(
@@ -363,25 +496,49 @@ class Qwen3Model:
         cfg = self.config
         num_tokens = x.shape[0]
         w = self.weights
+        attn = f"{prefix}.self_attn"
+
+        def _bias(projection: str, size: int, enabled: bool) -> np.ndarray | None:
+            return w.expect(f"{attn}.{projection}.bias", (size,)) if enabled else None
 
         q = split_heads(
-            linear(x, w.expect(f"{prefix}.self_attn.q_proj.weight", (cfg.q_proj_out, cfg.hidden_size))),
+            linear(
+                x,
+                w.expect(f"{attn}.q_proj.weight", (cfg.q_proj_out, cfg.hidden_size)),
+                _bias("q_proj", cfg.q_proj_out, cfg.qkv_bias),
+            ),
             cfg.num_attention_heads,
             cfg.head_dim,
         )
         k = split_heads(
-            linear(x, w.expect(f"{prefix}.self_attn.k_proj.weight", (cfg.kv_proj_out, cfg.hidden_size))),
+            linear(
+                x,
+                w.expect(f"{attn}.k_proj.weight", (cfg.kv_proj_out, cfg.hidden_size)),
+                _bias("k_proj", cfg.kv_proj_out, cfg.qkv_bias),
+            ),
             cfg.num_key_value_heads,
             cfg.head_dim,
         )
         v = split_heads(
-            linear(x, w.expect(f"{prefix}.self_attn.v_proj.weight", (cfg.kv_proj_out, cfg.hidden_size))),
+            linear(
+                x,
+                w.expect(f"{attn}.v_proj.weight", (cfg.kv_proj_out, cfg.hidden_size)),
+                _bias("v_proj", cfg.kv_proj_out, cfg.qkv_bias),
+            ),
             cfg.num_key_value_heads,
             cfg.head_dim,
         )
 
-        q = rms_norm(q, w.expect(f"{prefix}.self_attn.q_norm.weight", (cfg.head_dim,)), cfg.rms_norm_eps)
-        k = rms_norm(k, w.expect(f"{prefix}.self_attn.k_norm.weight", (cfg.head_dim,)), cfg.rms_norm_eps)
+        if cfg.qk_norm:
+            # transformers norms Q and K on [B, T, heads, head_dim] before the
+            # head transpose; RMSNorm is over the last axis, so norming after
+            # split_heads is the same numbers in a different axis order.
+            q = rms_norm(
+                q, w.expect(f"{attn}.q_norm.weight", (cfg.head_dim,)), cfg.rms_norm_eps
+            )
+            k = rms_norm(
+                k, w.expect(f"{attn}.k_norm.weight", (cfg.head_dim,)), cfg.rms_norm_eps
+            )
         q = np.ascontiguousarray(apply_rope(q, cos, sin))
         k = np.ascontiguousarray(apply_rope(k, cos, sin))
 
@@ -399,16 +556,108 @@ class Qwen3Model:
         merged = merge_heads(context, cfg.num_attention_heads, num_tokens, cfg.head_dim)
         return linear(
             merged,
-            w.expect(f"{prefix}.self_attn.o_proj.weight", (cfg.hidden_size, cfg.q_proj_out)),
+            w.expect(f"{attn}.o_proj.weight", (cfg.hidden_size, cfg.q_proj_out)),
+            _bias("o_proj", cfg.hidden_size, cfg.o_proj_bias),
         )
 
     def _mlp(self, prefix: str, x: np.ndarray) -> np.ndarray:
         """SwiGLU: ``down_proj(silu(gate_proj(x)) * up_proj(x))``."""
         cfg = self.config
         w = self.weights
-        gate = linear(x, w.expect(f"{prefix}.mlp.gate_proj.weight", (cfg.intermediate_size, cfg.hidden_size)))
-        up = linear(x, w.expect(f"{prefix}.mlp.up_proj.weight", (cfg.intermediate_size, cfg.hidden_size)))
+        mlp = f"{prefix}.mlp"
+
+        def _bias(projection: str, size: int) -> np.ndarray | None:
+            return w.expect(f"{mlp}.{projection}.bias", (size,)) if cfg.mlp_bias else None
+
+        gate = linear(
+            x,
+            w.expect(f"{mlp}.gate_proj.weight", (cfg.intermediate_size, cfg.hidden_size)),
+            _bias("gate_proj", cfg.intermediate_size),
+        )
+        up = linear(
+            x,
+            w.expect(f"{mlp}.up_proj.weight", (cfg.intermediate_size, cfg.hidden_size)),
+            _bias("up_proj", cfg.intermediate_size),
+        )
         return linear(
             silu(gate) * up,
-            w.expect(f"{prefix}.mlp.down_proj.weight", (cfg.hidden_size, cfg.intermediate_size)),
+            w.expect(f"{mlp}.down_proj.weight", (cfg.hidden_size, cfg.intermediate_size)),
+            _bias("down_proj", cfg.hidden_size),
         )
+
+
+class CausalLMModel(DecoderModel):
+    """A decoder whose task is producing the next token.
+
+    The only thing this adds over :class:`DecoderModel` is refusing to be built
+    for a checkpoint that cannot do the job — an embedding directory has no
+    ``lm_head``, and failing here names the reason instead of surfacing later as
+    a missing-tensor error from inside a forward pass.
+    """
+
+    def __init__(self, config: ModelConfig, weights: Weights) -> None:
+        if config.task == TASK_TEXT_EMBEDDING:
+            raise SlowQError(
+                f"the converted directory at hand is a {config.task!r} model, so it "
+                "has no output projection. Load it with slowq.embedding."
+                "EmbeddingModel (CLI: ``slowq embed``) instead of a causal LM."
+            )
+        super().__init__(config, weights)
+
+    @classmethod
+    def from_directory(cls, model_dir: str | Path, task: str | None = None) -> "CausalLMModel":
+        config, weights = load_config_and_weights(model_dir, task)
+        return cls(config, weights)
+
+
+def load_config_and_weights(
+    model_dir: str | Path, task: str | None = None
+) -> tuple[ModelConfig, Weights]:
+    """Read a converted directory's ``config.json`` and manifest together.
+
+    The task is taken from the manifest, which is the only place it can come
+    from: ``Qwen/Qwen3-Embedding-0.6B`` publishes ``model_type: "qwen3"`` and
+    ``architectures: ["Qwen3ForCausalLM"]``, identical to the chat model, so no
+    amount of looking at the config can tell the two apart. Passing ``task``
+    overrides the manifest and is how the reference-validation tool loads a
+    checkpoint it has just been told what to do with.
+
+    The *family* is the other direction: it is read from ``config.json``, and a
+    version-2 manifest also records the one the converter saw. The two must
+    agree. They are independent claims about the same directory, and a directory
+    where they disagree is refused here rather than loaded.
+
+    What the disagreement would otherwise cost depends on which side was altered.
+    Decoding always follows ``config.json``, so an edited manifest leaves the
+    numbers untouched and misreports the directory instead — ``slowq inspect``
+    would state a family the weights were never decoded with. A ``config.json``
+    swapped for another family's is the dangerous direction: that would not
+    crash, it would just compute different numbers.
+    """
+    root = Path(model_dir)
+    config_path = root / "config.json"
+    if not config_path.is_file():
+        raise SlowQError(
+            f"{config_path} not found; is this a converted SlowQ model directory?"
+        )
+    weights = Weights.from_directory(root)
+    raw: dict[str, Any] = json.loads(config_path.read_text(encoding="utf-8"))
+    resolved = task if task is not None else weights.manifest.task
+    if resolved is None:
+        # A version-1 manifest, written by SlowQ v0.1, which could only have
+        # converted a Qwen3 causal LM.
+        resolved = TASK_TEXT_GENERATION
+    config = ModelConfig.from_hf_config(raw, task=resolved)
+    recorded = weights.manifest.model_family
+    if recorded is not None and recorded != config.family:
+        # ``None`` means a version-1 manifest, which predates the key; those
+        # directories are still loadable and are not asked to grow a field they
+        # were written without.
+        raise ConfigError(
+            f"{root} is inconsistent: its manifest records "
+            f"model_family={recorded!r} but its config.json declares "
+            f"model_type={config.family!r}. Weights would be decoded with the "
+            f"{config.family!r} rules while the directory claims to be "
+            f"{recorded!r}. Re-convert it: python tools/convert_model.py --help"
+        )
+    return config, weights

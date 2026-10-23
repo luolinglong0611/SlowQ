@@ -1,15 +1,22 @@
-"""Real Qwen3-0.6B integration tests. Skipped unless explicitly enabled.
+"""Real-weight integration tests for the ``text-generation`` task.
 
-Enable them with::
+Enable them by naming a converted directory::
 
-    SLOWQ_MODEL_DIR=models/Qwen3-0.6B-slowq python -m pytest -m integration
+    SLOWQ_MODEL_DIR=models/SmolLM2-135M-Instruct-slowq python -m pytest -m integration
+
+Every converted chat model runs the same module: nothing here is specific to one
+checkpoint, so the assertions hold for Qwen3, Qwen2.5 and Llama alike and a new
+family only has to survive them rather than be written into them. The module
+skips itself when the directory's manifest records a different task — an
+embedding or an image+text checkpoint has its own module, because its invariants
+are different.
 
 They need a converted checkpoint (``tools/convert_model.py``) and, for the
 reference comparison, a capture made beforehand by ``tools/validate_reference.py
-ref`` — both ``artifacts/validation/ref.npz`` (the numbers) and
-``artifacts/validation/reference.json`` (the reference tokenizer's text and IDs,
-weight digests, capture configuration). The torch half never runs inside pytest,
-so these tests stay usable in an environment where torch is not installed.
+ref`` — both ``artifacts/validation/<model-name>/ref.npz`` (the numbers) and
+``.../reference.json`` (the reference tokenizer's text and IDs, weight digests,
+capture configuration). The torch half never runs inside pytest, so these tests
+stay usable in an environment where torch is not installed.
 
 Everything here is deliberately *not* about whether the answer reads well. The
 spec is explicit that "it produces Chinese" is not evidence of correctness, so
@@ -21,66 +28,41 @@ inside tolerances that were declared before they were measured.
 
 from __future__ import annotations
 
-import importlib.util
-import json
-import os
-import shutil
-import sys
+from dataclasses import fields
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from slowq.config import QWEN3_06B_REFERENCE
+import real_models
+from slowq.config import QWEN3_06B_REFERENCE, ModelConfig
 from slowq.engine import Engine
 from slowq.errors import ContextOverflowError
 from slowq.sampling import SamplingParams
-
-MODEL_DIR_ENV = "SLOWQ_MODEL_DIR"
-REPO_ROOT = Path(__file__).resolve().parents[1]
-RECORDED_ARTIFACTS = REPO_ROOT / "artifacts" / "validation"
-
-#: Declared before measuring. Rationale: chunking and caching only change FP32
-#: reduction order *within one implementation*, so the gate has to be tighter than
-#: the cross-implementation one in tools/validate_reference.py (rel_l2 1e-3,
-#: max_abs 5e-2 for the same quantities), not looser.
-#:
-#: Measured afterwards on Qwen3-0.6B (21-token prompt, chunk sizes 1/3/7/16, plus
-#: cached decode against one long prefill): worst logits rel_l2 1.64e-06, worst
-#: hidden rel_l2 2.28e-06, worst max_abs 6.58e-05 — i.e. 4x inside the rel_l2
-#: gate and 15x inside the max_abs gate. Both gates passed as declared; neither
-#: was widened to make a failure go away.
-INTERNAL_REL_L2_TOLERANCE = 1e-5
-INTERNAL_MAX_ABS_TOLERANCE = 1e-3
+from slowq.weights import (
+    LM_HEAD_TENSOR_NAME,
+    embedding_tensor_name,
+    output_embedding_name,
+)
 
 MAX_NEW_TOKENS = 48
+
+TASK = "text-generation"
 
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(
-        not os.environ.get(MODEL_DIR_ENV),
-        reason=f"set {MODEL_DIR_ENV} to a converted model directory to run these",
+        (reason := real_models.skip_reason(TASK)) is not None,
+        reason=reason or "",
     ),
 ]
 
 
-def load_validation_tool():
-    """Import ``tools/validate_reference.py`` without making ``tools`` a package."""
-    path = REPO_ROOT / "tools" / "validate_reference.py"
-    spec = importlib.util.spec_from_file_location("slowq_validate_reference", path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    # Registering before execution is not optional: the tool's dataclasses use
-    # ``from __future__ import annotations``, and dataclasses resolves those
-    # strings through ``sys.modules[cls.__module__]``.
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 @pytest.fixture(scope="module")
 def model_dir() -> Path:
-    return Path(os.environ[MODEL_DIR_ENV]).expanduser()
+    directory = real_models.selected_model_dir()
+    assert directory is not None  # guaranteed by the module-level skip
+    return directory
 
 
 @pytest.fixture(scope="module")
@@ -88,48 +70,10 @@ def engine(model_dir: Path) -> Engine:
     """One engine for the whole module.
 
     Sharing it is safe because the engine resets the KV cache at the *start* of
-    every request, and loading 2.4 GiB of weights once instead of per test is
-    the difference between a usable and an unbearable test run.
+    every request, and memory-mapping gigabytes of FP32 weights once instead of
+    per test is the difference between a usable and an unbearable test run.
     """
     return Engine.from_directory(model_dir, max_context=512, prefill_chunk_size=64)
-
-
-def assert_same_numerics(
-    ours: np.ndarray, theirs: np.ndarray, what: str, *, check_argmax: bool = True
-) -> None:
-    """Assert two arrays agree to within the declared internal tolerances.
-
-    Chunking and caching change FP32 reduction order and nothing else, so the
-    greedy choice must survive too — a difference large enough to flip an argmax
-    is a bug, not noise.
-
-    Both a relative and an absolute gate are needed. A pure relative criterion is
-    meaningless for a hidden-state vector, whose components span 0.0008 to 35:
-    the small ones carry a large relative error while contributing nothing to the
-    result. A pure absolute criterion would in turn let a whole vector drift.
-    """
-    ours = np.asarray(ours, dtype=np.float64).reshape(-1)
-    theirs = np.asarray(theirs, dtype=np.float64).reshape(-1)
-    assert ours.shape == theirs.shape, f"{what}: {ours.shape} vs {theirs.shape}"
-
-    difference = np.linalg.norm(ours - theirs)
-    denominator = np.linalg.norm(theirs)
-    rel_l2 = float(difference / denominator) if denominator else 0.0
-    max_abs = float(np.max(np.abs(ours - theirs))) if ours.size else 0.0
-
-    assert rel_l2 < INTERNAL_REL_L2_TOLERANCE, (
-        f"{what}: rel_l2 {rel_l2:.3e} exceeds the declared "
-        f"{INTERNAL_REL_L2_TOLERANCE:.3e} (max_abs {max_abs:.3e})"
-    )
-    assert max_abs < INTERNAL_MAX_ABS_TOLERANCE, (
-        f"{what}: max_abs {max_abs:.3e} exceeds the declared "
-        f"{INTERNAL_MAX_ABS_TOLERANCE:.3e} (rel_l2 {rel_l2:.3e})"
-    )
-    if check_argmax:
-        assert int(np.argmax(ours)) == int(np.argmax(theirs)), (
-            f"{what}: the greedy next token differs "
-            f"({int(np.argmax(ours))} vs {int(np.argmax(theirs))})"
-        )
 
 
 # --------------------------------------------------------------------------- #
@@ -137,37 +81,141 @@ def assert_same_numerics(
 # --------------------------------------------------------------------------- #
 
 
-def test_the_checkpoint_is_the_published_qwen3_06b_architecture(engine: Engine):
+def test_the_loaded_config_is_the_one_the_checkpoint_declares(
+    engine: Engine, model_dir: Path
+):
+    """Re-read ``config.json`` and require every field to survive the round trip.
+
+    Not a tautology: the engine's copy went through the manifest's recorded task,
+    the family lookup and ``_resolve_head_dim``, each of which could have fallen
+    back to a Qwen3-shaped default instead of reading the file.
+    """
+    config = engine.config
+    reread = ModelConfig.from_json_file(model_dir / "config.json", task=config.task)
+    for field in fields(ModelConfig):
+        if field.name == "raw":
+            continue
+        assert getattr(reread, field.name) == getattr(config, field.name), field.name
+
+
+def test_the_live_config_agrees_with_the_reference_reading_of_the_same_file(
+    engine: Engine, model_dir: Path
+):
+    """Two independent readings of one ``config.json`` must describe one model.
+
+    ``architecture_fingerprint`` restates what SlowQ loaded; the reference side
+    derived its copy from the official checkpoint using the modelling code's own
+    expressions (``config.attention_bias`` for Llama, the hard-coded bias of
+    ``Qwen2Attention``, ``head_dim`` versus ``hidden_size // heads``). They agree
+    only if the family's rules were applied rather than defaulted, which is the
+    check that would catch a Qwen2.5 loaded as a Qwen3 or a Llama given a Q/K
+    norm it does not have.
+    """
+    recorded = real_models.artifacts_dir(model_dir) / "reference.json"
+    if not recorded.is_file():
+        pytest.skip(f"no recorded reference architecture in {recorded}")
+    tool = real_models.load_validation_tool()
+    assert tool.architecture_fingerprint(engine.config) == real_models.read_json(
+        recorded
+    )["architecture"]
+
+
+def test_qwen3_06b_still_has_its_v01_parameters(engine: Engine, model_dir: Path):
+    """The v0.1 target model must not have drifted while families were added."""
+    source = real_models.read_json(model_dir / "manifest.json").get("source") or {}
+    identity = " ".join(str(source.get(key) or "") for key in ("repo_id", "local_path"))
+    if "Qwen3-0.6B" not in identity:
+        pytest.skip(f"this checkpoint is not Qwen/Qwen3-0.6B (source: {identity!r})")
     for field, expected in QWEN3_06B_REFERENCE.items():
         assert getattr(engine.config, field) == expected, field
 
 
-def test_the_weights_are_complete_and_the_tied_head_is_stored_once(engine: Engine):
+def test_the_weights_are_complete_and_a_tied_head_is_stored_once(
+    engine: Engine, model_dir: Path
+):
+    config = engine.config
     weights = engine.model.weights
-    weights.check_complete(engine.config)
-    assert weights.aliases == {"lm_head.weight": "model.embed_tokens.weight"}
+    weights.check_complete(config)
+    manifest = real_models.read_json(model_dir / "manifest.json")
+    assert dict(weights.aliases) == dict(manifest["aliases"])
     assert set(weights.dtype_names) == {"float32"}
-    # 0.6B parameters at 4 bytes each, minus the tied lm_head that is not stored
-    # twice: ~2.4 GiB, and the embedding table is ~0.6 GiB of that.
-    assert 2_300_000_000 < weights.deduplicated_bytes() < 2_500_000_000
+
+    embedding = embedding_tensor_name(config)
+    head = LM_HEAD_TENSOR_NAME
+    if config.tie_word_embeddings:
+        # Tied: the head is an alias, so its numbers exist exactly once on disk.
+        assert output_embedding_name(config) == embedding
+        assert weights.aliases[head] == embedding
+        assert head not in weights.manifest.tensors
+    else:
+        assert output_embedding_name(config) == head
+        assert head in weights.manifest.tensors
+        assert head not in weights.aliases
+        assert not np.array_equal(weights.get(head), weights.get(embedding))
+
+    # The manifest's shapes must describe the bytes that were actually written;
+    # ``deduplicated_bytes`` is what the metrics report as the model's size.
+    tensor_dir = model_dir / "tensors"
+    on_disk = sum(
+        np.load(tensor_dir / spec.file, mmap_mode="r").nbytes
+        for spec in weights.manifest.tensors.values()
+    )
+    assert on_disk == weights.deduplicated_bytes()
 
 
 def test_the_kv_cache_is_sized_from_the_real_config(engine: Engine):
-    per_token = engine.config.kv_bytes_per_token()
-    assert per_token == 2 * 28 * 8 * 128 * 4
+    """``head_dim`` has to be the checkpoint's own, not ``hidden_size // heads``.
+
+    The cache is sized from ``num_key_value_heads * head_dim``, so a derived
+    head_dim would silently allocate the wrong number of bytes on every model
+    where the two differ — Qwen3-0.6B (16 * 128 != 1024) and SmolVLM's decoder
+    (9 * 64 != 576) among them.
+    """
+    config = engine.config
+    weights = engine.model.weights
+    prefix = f"{config.tensor_prefix}.layers.0.self_attn"
+    assert weights.get(f"{prefix}.q_proj.weight").shape == (
+        config.num_attention_heads * config.head_dim,
+        config.hidden_size,
+    )
+    assert weights.get(f"{prefix}.k_proj.weight").shape == (
+        config.num_key_value_heads * config.head_dim,
+        config.hidden_size,
+    )
+
+    per_token = config.kv_bytes_per_token()
+    assert per_token == (
+        2 * config.num_hidden_layers * config.num_key_value_heads * config.head_dim * 4
+    )
     assert engine.kv_cache.allocated_bytes() == per_token * engine.max_context
 
 
 def test_loading_never_reaches_the_network(model_dir: Path, monkeypatch):
     """``from_directory`` must work offline; a socket use would be a bug."""
-    import socket
-
-    def refuse(*args, **kwargs):
-        raise AssertionError("the runtime opened a network connection")
-
-    monkeypatch.setattr(socket, "create_connection", refuse)
-    monkeypatch.setattr(socket.socket, "connect", refuse)
+    real_models.block_network(monkeypatch)
     assert Engine.from_directory(model_dir, max_context=64) is not None
+
+
+def test_the_cli_generates_offline(model_dir: Path, monkeypatch, capsys):
+    """The whole user-facing path, with the network unplugged."""
+    from slowq import cli
+
+    real_models.block_network(monkeypatch)
+    code = cli.main(
+        [
+            "generate",
+            "--model",
+            str(model_dir),
+            "--prompt",
+            "Reply with the single word: offline",
+            "--max-new-tokens",
+            "8",
+            "--max-context",
+            "128",
+        ]
+    )
+    assert code == 0
+    assert capsys.readouterr().out.strip()
 
 
 # --------------------------------------------------------------------------- #
@@ -191,11 +239,19 @@ def test_a_fixed_seed_reproduces_a_sampled_answer(engine: Engine):
     assert first.token_ids == second.token_ids
 
 
-def test_an_answer_is_complete_text_not_a_stream_of_replacement_characters(engine: Engine):
+def test_an_answer_is_the_tokenizers_own_decoding_of_the_returned_ids(engine: Engine):
     """Not a quality check — a check that incremental decoding is lossless.
 
     A model that produced fluent Chinese with a broken byte-level decoder would
     still fail here, and a correct decoder that produced nonsense would pass.
+
+    What must *not* be asserted is the absence of U+FFFD. Generation stops at
+    ``max_new_tokens``, and stopping in the middle of a multi-byte character
+    leaves the final token's bytes incomplete: Qwen3-1.7B answers the emoji
+    question with a 3-byte lead plus one continuation byte at token 48 of 48, and
+    a one-shot decode of the same IDs renders the same replacement character.
+    That is the model's output, not a decoding bug, so the invariant is agreement
+    between the two decoders rather than a character blacklist.
     """
     for messages in (
         [{"role": "user", "content": "用一个 emoji 表示开心 🎉，然后解释它的 Unicode 名称。"}],
@@ -203,7 +259,7 @@ def test_an_answer_is_complete_text_not_a_stream_of_replacement_characters(engin
     ):
         result = engine.generate(messages, max_new_tokens=MAX_NEW_TOKENS)
         assert result.text.strip(), "the model produced no visible text"
-        assert "\ufffd" not in result.text
+        assert result.text == engine.tokenizer.decode(list(result.token_ids))
         # The stop token terminates generation but must never be rendered.
         if result.stopped_on_eos:
             assert result.token_ids[-1] in engine.stop_ids
@@ -265,8 +321,8 @@ def test_chunked_prefill_matches_a_single_prefill(engine: Engine, chunk: int):
         result = model.forward(prompt_ids[start : start + chunk], chunked)
 
     assert chunked.length == one_shot.length == len(prompt_ids)
-    assert_same_numerics(result.logits, expected.logits, f"chunk={chunk} logits")
-    assert_same_numerics(
+    real_models.assert_same_numerics(result.logits, expected.logits, f"chunk={chunk} logits")
+    real_models.assert_same_numerics(
         result.hidden_states[-1],
         expected.hidden_states[-1],
         f"chunk={chunk} final hidden state",
@@ -290,7 +346,7 @@ def test_cached_decode_matches_one_long_prefill(engine: Engine):
     recomputed = model.new_cache(len(prompt_ids) + 8)
     expected = model.forward([*prompt_ids, *generated], recomputed).logits
 
-    assert_same_numerics(logits, expected, "cached decode vs one long prefill")
+    real_models.assert_same_numerics(logits, expected, "cached decode vs one long prefill")
 
 
 def test_repeating_a_request_reuses_a_reset_cache(engine: Engine):
@@ -300,213 +356,3 @@ def test_repeating_a_request_reuses_a_reset_cache(engine: Engine):
     second = engine.generate(messages, max_new_tokens=8)
     assert second.token_ids == first.token_ids
     assert engine.kv_cache.length == len(first.prompt_token_ids) + len(first.token_ids) - 1
-
-
-# --------------------------------------------------------------------------- #
-# against the Transformers reference
-# --------------------------------------------------------------------------- #
-
-#: The reference half writes both files. ``ref.npz`` holds the numbers and
-#: ``reference.json`` holds the *content* the numbers are graded against: the
-#: reference tokenizer's rendered text and token IDs, sha256 digests of whole
-#: weight tensors, the digests of the checkpoint files it read, and the capture
-#: configuration. Neither file contains a verdict, so there is nothing to copy
-#: forward from an older run.
-RECORDED_REFERENCE_FILES = ("ref.npz", "reference.json")
-
-
-def recorded_reference_is_complete() -> bool:
-    return all((RECORDED_ARTIFACTS / name).is_file() for name in RECORDED_REFERENCE_FILES)
-
-
-@pytest.fixture(scope="module")
-def fresh_numpy_run(model_dir: Path, tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Run the NumPy half once, against the real model, next to the recorded reference.
-
-    Module-scoped because this is the slow part (four samples through a 0.6B FP32
-    model with a chunk size of 8). The tests below copy the artifacts and break
-    one thing each, which is cheap: without the weight blobs ``slowq.npz`` is a
-    few MiB.
-    """
-    if not recorded_reference_is_complete():
-        pytest.skip(
-            f"no complete reference capture in {RECORDED_ARTIFACTS} (need "
-            f"{', '.join(RECORDED_REFERENCE_FILES)}); run "
-            "'python tools/validate_reference.py ref' first"
-        )
-    work = tmp_path_factory.mktemp("validation")
-    for name in RECORDED_REFERENCE_FILES:
-        shutil.copyfile(RECORDED_ARTIFACTS / name, work / name)
-    tool = load_validation_tool()
-    argv = [
-        "numpy",
-        "--model",
-        str(model_dir),
-        "--artifacts",
-        str(work),
-        "--max-context",
-        "512",
-        "--prefill-chunk-size",
-        "8",
-        "--decode-steps",
-        "3",
-    ]
-    assert tool.run_numpy_side(tool.build_parser().parse_args(argv)) == 0
-    return work
-
-
-def copied_artifacts(source: Path, destination: Path) -> Path:
-    for name in ("samples.json", "slowq.npz", *RECORDED_REFERENCE_FILES):
-        shutil.copyfile(source / name, destination / name)
-    return destination
-
-
-def compare(directory: Path) -> int:
-    tool = load_validation_tool()
-    return tool.run_compare(
-        tool.build_parser().parse_args(["compare", "--artifacts", str(directory)])
-    )
-
-
-def rewrite(directory: Path, mutate) -> dict:
-    path = directory / "samples.json"
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    mutate(payload)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return payload
-
-
-def test_the_current_code_still_matches_the_recorded_reference(
-    fresh_numpy_run: Path, tmp_path: Path, capsys
-):
-    """Re-run the NumPy side and compare it against the captured torch tensors.
-
-    The reference capture needs torch and 2.4 GiB of FP32 weights, so it is done
-    once by ``tools/validate_reference.py ref`` and stored. This test regenerates
-    only the SlowQ half, which means it fails if the runtime drifts away from the
-    numbers that were signed off. Nothing is carried over from the recorded run:
-    the tokenizer text, the token IDs and the weight digests compared here are
-    the ones *this* run produced.
-    """
-    directory = copied_artifacts(fresh_numpy_run, tmp_path)
-    tool = load_validation_tool()
-    expected = len(tool.expected_numeric_keys(json.loads(
-        (directory / "samples.json").read_text(encoding="utf-8")
-    )["capture"]))
-
-    assert compare(directory) == 0, (
-        "SlowQ no longer matches the Transformers reference within the declared "
-        f"tolerances: {tool.TOLERANCES}"
-    )
-    assert f"PASS: {expected} tensors compared" in capsys.readouterr().out
-
-
-def test_this_run_records_its_own_evidence_and_inherits_no_verdicts(
-    fresh_numpy_run: Path, model_dir: Path, engine: Engine
-):
-    """The artifact a fresh run writes must contain content, not conclusions."""
-    tool = load_validation_tool()
-    payload = json.loads((fresh_numpy_run / "samples.json").read_text(encoding="utf-8"))
-    reference = json.loads((fresh_numpy_run / "reference.json").read_text(encoding="utf-8"))
-
-    # The fields the old test copied forward do not exist any more, on either side.
-    for side in (payload, reference):
-        assert "tokenizer_check" not in side
-        assert "weight_check" not in side
-
-    manifest = json.loads((model_dir / "manifest.json").read_text(encoding="utf-8"))
-    assert payload["source"]["revision"] == manifest["source"]["revision"]
-    assert payload["architecture"]["num_hidden_layers"] == engine.config.num_hidden_layers
-    assert payload["architecture"]["vocab_size"] == engine.config.vocab_size
-    assert payload["capture"]["artifact_format"] == tool.ARTIFACT_FORMAT
-    assert payload["capture"] == reference["capture"]
-    assert payload["architecture"] == reference["architecture"]
-    assert set(payload["weight_digests"]) == set(tool.WEIGHT_CHECK_SAMPLE)
-    assert {entry["name"] for entry in payload["tokenizer"]} == set(
-        payload["capture"]["sample_names"]
-    )
-    # Every digest states the byte representation it was taken over.
-    for digest in payload["weight_digests"].values():
-        assert digest["dtype"] == "<f4"
-        assert digest["byte_order"] == "little"
-        assert digest["spec"] == tool.DIGEST_SPEC_VERSION
-        assert digest["non_finite_elements"] == 0
-    # The reference side hashed the checkpoint it loaded; the manifest claims the
-    # same bytes, which is what ties the two captures to one model.
-    assert set(reference["source"]["files"]) <= set(payload["source"]["files"])
-    assert reference["source"]["files"]
-
-
-def test_a_drifted_tokenizer_output_fails_against_the_recorded_reference(
-    fresh_numpy_run: Path, tmp_path: Path, capsys
-):
-    """One token ID changed on the SlowQ side is a failed validation.
-
-    This is the case the copied ``tokenizer_check`` booleans used to hide: the
-    reference's own IDs are stored as data, so the current output is compared
-    against them every run.
-    """
-    directory = copied_artifacts(fresh_numpy_run, tmp_path)
-
-    def drift(payload: dict) -> None:
-        payload["tokenizer"][0]["ids"] = [
-            token + 1 for token in payload["tokenizer"][0]["ids"]
-        ]
-
-    rewrite(directory, drift)
-    assert compare(directory) == 1
-    assert "different token IDs" in capsys.readouterr().err
-
-
-def test_a_drifted_render_fails_against_the_recorded_reference(
-    fresh_numpy_run: Path, tmp_path: Path, capsys
-):
-    directory = copied_artifacts(fresh_numpy_run, tmp_path)
-
-    def drift(payload: dict) -> None:
-        payload["tokenizer"][0]["text"] += " "
-
-    rewrite(directory, drift)
-    assert compare(directory) == 1
-    assert "renders different chat text" in capsys.readouterr().err
-
-
-def test_a_drifted_converted_weight_fails_against_the_recorded_reference(
-    fresh_numpy_run: Path, tmp_path: Path, capsys
-):
-    """The weights are compared by digest, so a changed tensor cannot slip through."""
-    directory = copied_artifacts(fresh_numpy_run, tmp_path)
-    tool = load_validation_tool()
-
-    def drift(payload: dict) -> None:
-        payload["weight_digests"]["model.norm.weight"] = tool.tensor_digest(
-            np.zeros(payload["weight_digests"]["model.norm.weight"]["shape"], dtype=np.float32)
-        )
-
-    rewrite(directory, drift)
-    assert compare(directory) == 1
-    assert "the conversion is not exact" in capsys.readouterr().err
-
-
-def test_a_dropped_tensor_fails_against_the_recorded_reference(
-    fresh_numpy_run: Path, tmp_path: Path, capsys
-):
-    directory = copied_artifacts(fresh_numpy_run, tmp_path)
-    blobs = dict(np.load(directory / "slowq.npz"))
-    dropped = sorted(blobs)[-1]
-    del blobs[dropped]
-    np.savez_compressed(directory / "slowq.npz", **blobs)
-    assert compare(directory) == 1
-    err = capsys.readouterr().err
-    assert "missing from the SlowQ side" in err
-    assert dropped in err
-
-
-def test_a_reference_capture_that_is_incomplete_prompts_a_recapture(
-    fresh_numpy_run: Path, tmp_path: Path, capsys
-):
-    """Old or partial artifacts must ask for a new capture, never pass."""
-    directory = copied_artifacts(fresh_numpy_run, tmp_path)
-    (directory / "reference.json").unlink()
-    assert compare(directory) == 1
-    assert "re-capture" in capsys.readouterr().err

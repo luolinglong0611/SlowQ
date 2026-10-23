@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert an official Qwen3 checkpoint into SlowQ's offline FP32 format.
+"""Convert an official checkpoint into SlowQ's offline FP32 format.
 
     python tools/convert_model.py --repo Qwen/Qwen3-0.6B --out models/Qwen3-0.6B-slowq
     python tools/convert_model.py --source models/Qwen3-0.6B-hf --out models/Qwen3-0.6B-slowq
@@ -19,9 +19,17 @@ Design notes:
   with no rounding and no denormal/NaN surprises.
 * **Weights keep HF's ``[out_features, in_features]`` layout.** The runtime
   computes ``x @ W.T``, so neither conversion nor inference transposes data.
-* **Tied embeddings are stored once.** Qwen3-0.6B ties ``lm_head.weight`` to
-  ``model.embed_tokens.weight``; we verify the two byte ranges are identical and
-  record an alias instead of duplicating 600 MiB.
+* **Tied embeddings are stored once.** ``tie_word_embeddings`` maps
+  ``lm_head.weight`` onto ``model.embed_tokens.weight`` in the manifest instead
+  of duplicating 600 MiB. When the checkpoint also stored the head (Qwen3 does),
+  the two byte ranges are compared first and a mismatch aborts the conversion;
+  when it did not (SmolLM2, Qwen2.5), the config flag is the evidence, the same
+  one HF uses to build the shared module.
+* **The task is recorded, never guessed from a name.** ``Qwen3-Embedding-0.6B``
+  declares the same ``model_type`` and ``architectures`` as the chat model, so
+  ``--task`` decides (``auto`` reads the sentence-transformers marker files the
+  embedding export adds) and the answer lands in the manifest. Which tensors are
+  required then follows from the family *and* the task.
 * The source revision is pinned and written into the manifest, so a conversion
   is reproducible and inference afterwards is fully offline.
 * **A failed conversion cannot damage a model.** Everything is written into a
@@ -45,6 +53,7 @@ import json
 import mmap
 import os
 import shutil
+import ssl
 import sys
 import tempfile
 import time
@@ -59,25 +68,51 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from slowq.config import ModelConfig  # noqa: E402
+from slowq.config import (  # noqa: E402
+    FAMILY_IDEFICS3,
+    TASK_IMAGE_TEXT_GENERATION,
+    TASK_TEXT_EMBEDDING,
+    TASK_TEXT_GENERATION,
+    ModelConfig,
+)
 from slowq.errors import ConfigError, SlowQError  # noqa: E402
 from slowq.weights import (  # noqa: E402
-    EMBEDDING_TENSOR_NAME,
     MANIFEST_FILENAME,
     SUPPORTED_FORMAT_VERSION,
     TENSOR_SUBDIR,
     TIED_OUTPUT_EMBEDDING_ALIAS,
     Weights,
+    embedding_tensor_name,
     required_tensors,
 )
 
 DEFAULT_ENDPOINT = "https://huggingface.co"
 DEFAULT_REPO = "Qwen/Qwen3-0.6B"
-#: Pinned so a re-run months from now still produces the same bytes.
+#: Pinned so a re-run months from now still produces the same bytes. This is a
+#: property of *this* repo only: every other repo resolves its own commit at
+#: download time and records that in its manifest.
 DEFAULT_REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
 CONFIG_FILE = "config.json"
 GENERATION_CONFIG_FILE = "generation_config.json"
+#: Read by ``slowq.tokenizer`` from the converted directory, so they are copied
+#: into it. Only the first two are mandatory; the rest are per-checkpoint.
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt")
+#: Also tokenizer-side, also copied. ``chat_template.json`` is how newer repos
+#: publish the template separately from ``tokenizer_config.json``.
+EXTRA_TOKENIZER_FILES = ("added_tokens.json", "special_tokens_map.json", "chat_template.json")
+#: An image+text model must carry its processor settings into the offline
+#: directory, or the pixel preprocessing cannot be reproduced without a network.
+PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json")
+#: The only offline evidence that a Qwen3 checkpoint is an *embedding* model.
+#: ``Qwen/Qwen3-Embedding-0.6B`` publishes ``model_type: "qwen3"`` and
+#: ``architectures: ["Qwen3ForCausalLM"]`` — byte-for-byte the same task-relevant
+#: fields as the chat model — so the task has to come from somewhere else, and
+#: these three files are what the sentence-transformers export adds.
+EMBEDDING_MARKER_FILES = (
+    "modules.json",
+    "config_sentence_transformers.json",
+    "1_Pooling/config.json",
+)
 SAFETENSORS_INDEX_FILE = "model.safetensors.index.json"
 SAFETENSORS_FILE = "model.safetensors"
 CHUNK_BYTES = 1 << 20
@@ -87,6 +122,22 @@ CHUNK_BYTES = 1 << 20
 #: so an interrupted one can be resumed instead of being refused forever.
 SNAPSHOT_MARKER = ".slowq-snapshot.json"
 COMMIT_SHA_LENGTH = 40
+
+#: ``--task`` values. ``auto`` is decided from files present in the checkpoint,
+#: never from the repo's name.
+TASK_AUTO = "auto"
+TASK_CHOICES = (
+    TASK_AUTO,
+    TASK_TEXT_GENERATION,
+    TASK_TEXT_EMBEDDING,
+    TASK_IMAGE_TEXT_GENERATION,
+)
+
+#: ``model_type`` of a *wrapper* config that nests a text decoder beside a vision
+#: tower. None of these is a text decoder family, which is what makes the task
+#: unambiguous: ``ModelConfig.from_hf_config`` refuses them outright, so there is
+#: no second reading of the same weights to choose between.
+VISION_WRAPPER_TYPES = (FAMILY_IDEFICS3,)
 
 
 NUMPY_DTYPE_BY_SAFETENSORS = {
@@ -246,16 +297,60 @@ def endpoint() -> str:
     return os.environ.get("HF_ENDPOINT", DEFAULT_ENDPOINT).rstrip("/")
 
 
+_TLS_CONTEXT: ssl.SSLContext | None = None
+
+
+def tls_context() -> ssl.SSLContext:
+    """A verifying TLS context whose trust store this interpreter can actually find.
+
+    python.org's macOS framework builds ship no CA bundle until
+    ``Install Certificates.command`` has been run, so the default context
+    verifies against an empty store and *every* request to huggingface.co fails
+    with ``CERTIFICATE_VERIFY_FAILED`` while ``curl`` on the same machine works.
+    ``certifi`` is already installed alongside ``huggingface_hub``, so pointing
+    OpenSSL at its bundle fixes the download.
+
+    Verification is never switched off. These bytes become the model, and a
+    checkpoint fetched over an unverified connection is not reproducible in the
+    only sense that matters.
+    """
+    global _TLS_CONTEXT
+    if _TLS_CONTEXT is not None:
+        return _TLS_CONTEXT
+    defaults = ssl.get_default_verify_paths()
+    has_store = (defaults.cafile and Path(defaults.cafile).is_file()) or (
+        defaults.openssl_cafile and Path(defaults.openssl_cafile).is_file()
+    )
+    if has_store:
+        _TLS_CONTEXT = ssl.create_default_context()
+        return _TLS_CONTEXT
+    try:
+        import certifi
+    except ImportError as exc:  # pragma: no cover - depends on the interpreter
+        raise SlowQError(
+            "this Python installation has no CA bundle "
+            f"(openssl_cafile={defaults.openssl_cafile!r} does not exist), so HTTPS "
+            "certificate verification cannot succeed, and certifi is not installed "
+            "to supply one. Either run the 'Install Certificates' step that came "
+            "with your Python, or 'pip install certifi'. SlowQ will not disable "
+            "verification to work around it."
+        ) from exc
+    _TLS_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+    return _TLS_CONTEXT
+
+
 def http_get(url: str, timeout: float = 60.0) -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": "slowq-convert/0.1"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    request = urllib.request.Request(url, headers={"User-Agent": "slowq-convert/0.2"})
+    with urllib.request.urlopen(request, timeout=timeout, context=tls_context()) as response:
         return response.read()
 
 
 def http_download(url: str, destination: Path, timeout: float = 60.0) -> None:
     """Stream a file to disk, reporting progress on stderr."""
-    request = urllib.request.Request(url, headers={"User-Agent": "slowq-convert/0.1"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    request = urllib.request.Request(url, headers={"User-Agent": "slowq-convert/0.2"})
+    with urllib.request.urlopen(
+        request, timeout=timeout, context=tls_context()
+    ) as response:
         total = int(response.headers.get("Content-Length") or 0)
         temporary = destination.with_suffix(destination.suffix + ".part")
         received = 0
@@ -331,8 +426,15 @@ class SnapshotFile:
 
 
 def list_repo_files(repo: str, revision: str) -> list[SnapshotFile]:
+    """Every file of one revision, including nested ones.
+
+    ``recursive=true`` is not optional: the embedding checkpoints publish their
+    pooling settings as ``1_Pooling/config.json``, and a flat listing reports only
+    the directory, which is exactly the file that decides the task.
+    """
+    url = f"{endpoint()}/api/models/{repo}/tree/{revision}?recursive=true"
     try:
-        listing = json.loads(http_get(f"{endpoint()}/api/models/{repo}/tree/{revision}"))
+        listing = json.loads(http_get(url))
     except (urllib.error.URLError, json.JSONDecodeError, TimeoutError) as exc:
         raise SlowQError(f"could not list files of {repo}@{revision}: {exc}") from exc
     files: list[SnapshotFile] = []
@@ -353,13 +455,27 @@ def list_repo_files(repo: str, revision: str) -> list[SnapshotFile]:
     return files
 
 
+#: Everything a conversion may read. Deliberately a whitelist: the SmolLM2 repos
+#: also publish ``onnx/``, ``runs/`` and trainer state, and downloading 400 MiB of
+#: ONNX to convert 269 MiB of safetensors would be a bug, not a convenience.
+WANTED_SNAPSHOT_NAMES = frozenset(
+    {
+        CONFIG_FILE,
+        GENERATION_CONFIG_FILE,
+        SAFETENSORS_INDEX_FILE,
+        *TOKENIZER_FILES,
+        *EXTRA_TOKENIZER_FILES,
+        *PROCESSOR_FILES,
+        *EMBEDDING_MARKER_FILES,
+    }
+)
+
+
 def wanted_snapshot_files(repo: str, revision: str) -> list[SnapshotFile]:
     return [
         entry
         for entry in list_repo_files(repo, revision)
-        if entry.path.endswith(".safetensors")
-        or entry.path in (CONFIG_FILE, GENERATION_CONFIG_FILE, SAFETENSORS_INDEX_FILE)
-        or entry.path in TOKENIZER_FILES
+        if entry.path.endswith(".safetensors") or entry.path in WANTED_SNAPSHOT_NAMES
     ]
 
 
@@ -547,18 +663,20 @@ def download_snapshot(repo: str, revision: str, cache_root: Path) -> Path:
 
 
 def reject_stale_files(root: Path, wanted: Sequence[SnapshotFile]) -> None:
-    """A leftover shard or index from another revision would be read as truth."""
+    """A leftover shard or index from another revision would be read as truth.
+
+    Only files SlowQ would actually read are policed — a stray ``README.md`` or a
+    trainer log in the cache directory is the user's business, not a reason to
+    refuse a snapshot.
+    """
     expected = {entry.path for entry in wanted} | {SNAPSHOT_MARKER}
     stale = sorted(
-        str(path.relative_to(root))
+        relative
         for path in root.rglob("*")
         if path.is_file()
-        and str(path.relative_to(root)) not in expected
-        and not path.name.endswith(".part")
-        and (
-            path.suffix == ".safetensors"
-            or path.name in (SAFETENSORS_INDEX_FILE, CONFIG_FILE, *TOKENIZER_FILES)
-        )
+        and (relative := str(path.relative_to(root))) not in expected
+        and not relative.endswith(".part")
+        and (path.suffix == ".safetensors" or relative in WANTED_SNAPSHOT_NAMES)
     )
     for path in root.rglob("*.part"):
         path.unlink()  # our own interrupted download, never a user file
@@ -620,27 +738,219 @@ def tied_head_matches_embedding(source: Path, head: SafeTensorEntry, embedding: 
     return tensor_sha256_in(source, head) == tensor_sha256_in(source, embedding)
 
 
-def inspect_source(source: Path) -> tuple[ModelConfig, dict[str, SafeTensorEntry], dict[str, tuple[int, ...]]]:
+def embedding_markers_present(source: Path) -> list[str]:
+    return [name for name in EMBEDDING_MARKER_FILES if (source / name).is_file()]
+
+
+def vision_wrapper_evidence(source: Path) -> tuple[bool, str]:
+    """Is this checkpoint an image+text model? Returns ``(answer, evidence)``.
+
+    Two pieces of file evidence, and both are required. ``config.json``'s
+    ``model_type`` being a vision wrapper *with* a nested ``vision_config`` and an
+    ``image_token_id`` is the fact that no text decoder loader can read it; the
+    processor files are what make the pixel pipeline reproducible offline. A
+    vision config missing them is refused rather than converted into a directory
+    that loads and then cannot resize an image, and the refusal names the file.
+    """
+    config_path = source / CONFIG_FILE
+    if not config_path.is_file():
+        return False, f"no {CONFIG_FILE}"
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    model_type = raw.get("model_type")
+    if model_type not in VISION_WRAPPER_TYPES:
+        return False, f"{CONFIG_FILE} model_type={model_type!r}"
+
+    if not isinstance(raw.get("vision_config"), Mapping):
+        raise SlowQError(
+            f"{config_path} declares model_type={model_type!r} but nests no "
+            "'vision_config' object, so there is no vision tower to convert. SlowQ "
+            "will not treat a config like this as a text model either: no decoder "
+            "family reads it."
+        )
+    if not isinstance(raw.get("image_token_id"), int):
+        raise SlowQError(
+            f"{config_path} declares model_type={model_type!r} but has no int "
+            "'image_token_id', so image features could not be merged onto the "
+            "prompt's placeholder positions."
+        )
+    missing = [name for name in PROCESSOR_FILES if not (source / name).is_file()]
+    if missing:
+        raise SlowQError(
+            f"{source} is an image+text checkpoint ({model_type}) but is missing "
+            f"{', '.join(missing)}. SlowQ reproduces the official pixel "
+            "preprocessing from those files, so converting without them would "
+            "produce a directory that cannot read an image offline."
+        )
+    return True, (
+        f"{CONFIG_FILE} model_type={model_type!r} nests a vision_config and an "
+        f"image_token_id, plus {', '.join(PROCESSOR_FILES)}"
+    )
+
+
+def detect_task(source: Path, requested: str) -> tuple[str, str]:
+    """Decide what this checkpoint is for, and return ``(task, evidence)``.
+
+    ``auto`` reads files, not the repo's name: the sentence-transformers export
+    that makes ``Qwen/Qwen3-Embedding-0.6B`` an embedding model adds
+    ``modules.json``, ``config_sentence_transformers.json`` and
+    ``1_Pooling/config.json``, and none of the generation checkpoints SlowQ
+    converts has them. Some-but-not-all is refused rather than resolved by
+    majority vote, because a partial export is exactly the case where guessing
+    would produce a directory that loads and answers the wrong question.
+
+    An explicit ``--task`` is still cross-checked against the same files: asking
+    for image+text on a text checkpoint (or the reverse) would otherwise be
+    accepted here and fail later, in a loader, with a message about weights.
+    """
+    markers = embedding_markers_present(source)
+    is_vision, vision_evidence = vision_wrapper_evidence(source)
+    if requested != TASK_AUTO:
+        if requested == TASK_IMAGE_TEXT_GENERATION and not is_vision:
+            raise SlowQError(
+                f"--task {TASK_IMAGE_TEXT_GENERATION} was requested but {source} is "
+                f"not an image+text checkpoint ({vision_evidence})"
+            )
+        if is_vision and requested != TASK_IMAGE_TEXT_GENERATION:
+            raise SlowQError(
+                f"--task {requested} was requested but {source} is an image+text "
+                f"checkpoint: {vision_evidence}"
+            )
+        return requested, f"--task {requested}"
+
+    if is_vision and markers:
+        raise SlowQError(
+            f"{source} has both a vision wrapper config ({vision_evidence}) and the "
+            f"sentence-transformers marker files ({', '.join(markers)}). Those two "
+            "tasks need different directories, so SlowQ refuses to pick one."
+        )
+    if is_vision:
+        return TASK_IMAGE_TEXT_GENERATION, vision_evidence
+    if len(markers) == len(EMBEDDING_MARKER_FILES):
+        return TASK_TEXT_EMBEDDING, "found " + ", ".join(markers)
+    if markers:
+        raise SlowQError(
+            f"{source} has some but not all of the sentence-transformers marker "
+            f"files (found {', '.join(markers)}; a complete export has all of "
+            f"{', '.join(EMBEDDING_MARKER_FILES)}). SlowQ will not guess between "
+            "text-generation and text-embedding from a partial export — pass "
+            "--task explicitly."
+        )
+    return TASK_TEXT_GENERATION, "no sentence-transformers marker files"
+
+
+def plan_tensor_names(
+    expected: Mapping[str, tuple[int, ...]],
+    source_names: set[str],
+    prefix: str,
+) -> dict[str, str]:
+    """Map each canonical tensor name to the name it has in the source checkpoint.
+
+    The same decoder ships under two layouts. Inside a ``*ForCausalLM`` wrapper it
+    is nested under ``model.``; as a bare ``*Model`` export — which is how
+    Qwen3-Embedding publishes its weights — it has no prefix at all. Both readings
+    are tried against the source listing, and the published one wins when it
+    covers every required tensor. Neither covering it is an error naming the
+    tensors, so the rename stays a verified fact rather than a guess, and a
+    checkpoint is never half-converted.
+    """
+    dot = f"{prefix}."
+    as_published = {name: name for name in expected}
+    unprefixed = {
+        name: (name[len(dot) :] if name.startswith(dot) else name) for name in expected
+    }
+    if set(as_published.values()) <= source_names:
+        return as_published
+    if set(unprefixed.values()) <= source_names:
+        return unprefixed
+
+    best = max(
+        (as_published, unprefixed),
+        key=lambda plan: sum(source in source_names for source in plan.values()),
+    )
+    missing = [name for name, source in best.items() if source not in source_names]
+    raise SlowQError(
+        "checkpoint is missing required tensor(s): "
+        + ", ".join(missing[:8])
+        + (f" … ({len(missing)} in total)" if len(missing) > 8 else "")
+        + f"\n  tried the published names and the same names without the {dot!r} "
+        "decoder prefix; neither explains this checkpoint"
+    )
+
+
+@dataclass(frozen=True)
+class SourcePlan:
+    """One checkpoint, read: what it is, and how its tensors map onto SlowQ's names.
+
+    ``text`` is always the text decoder's :class:`ModelConfig` — for an image+text
+    model that is the *nested* one, which is also what the runtime's decoder reads.
+    ``vision`` is the whole ``SmolVLMConfig`` when the task is image+text and
+    ``None`` otherwise, so the single place that knows about a vision tower stays
+    :mod:`slowq.vlm`.
+    """
+
+    text: ModelConfig
+    by_name: dict[str, SafeTensorEntry]
+    expected: dict[str, tuple[int, ...]]
+    plan: dict[str, str]
+    task: str
+    vision: Any | None = None
+
+    @property
+    def family(self) -> str:
+        """The family recorded in the manifest: the wrapper's, not the decoder's.
+
+        SmolVLM's decoder is a llama, but the directory holds a vision tower too,
+        and ``slowq.vlm`` refuses to load one whose manifest says otherwise.
+        """
+        return FAMILY_IDEFICS3 if self.vision is not None else self.text.family
+
+
+def inspect_source(source: Path, task: str) -> SourcePlan:
     """Read the checkpoint's config and tensor listing, and check it is complete."""
     config_path = source / CONFIG_FILE
     if not config_path.is_file():
         raise SlowQError(f"{config_path} not found; is {source} an official checkpoint?")
     hf_config = json.loads(config_path.read_text(encoding="utf-8"))
-    config = ModelConfig.from_hf_config(hf_config)
+
+    vision = None
+    if task == TASK_IMAGE_TEXT_GENERATION:
+        # Imported here, not at module scope: Pillow is an optional dependency and
+        # ``slowq.vlm`` is the only module that mentions it. A text conversion must
+        # keep working in an environment that has neither.
+        from slowq.vlm import ImageProcessorConfig, SmolVLMConfig
+
+        vision = SmolVLMConfig.from_hf_config(
+            hf_config, ImageProcessorConfig.from_directory(source), where=CONFIG_FILE
+        )
+        config = vision.text
+    else:
+        config = ModelConfig.from_hf_config(hf_config, task=task)
 
     entries = list(iter_safetensors_entries(source))
     by_name = {entry.name: entry for entry in entries}
     if len(by_name) != len(entries):
         raise SlowQError("checkpoint lists the same tensor name in two files")
 
-    # required_tensors() already omits lm_head.weight when the model is tied.
-    expected = required_tensors(config)
-    missing = [name for name in expected if name not in by_name]
-    if missing:
-        raise SlowQError(
-            "checkpoint is missing required tensor(s): " + ", ".join(missing[:8])
-        )
-    return config, by_name, expected
+    # required_tensors() is family- and task-aware: it omits lm_head.weight when
+    # the embeddings are tied, omits it entirely for an embedding model that never
+    # projects to the vocabulary, and asks for bias vectors and q/k norms only
+    # where that family's nn.Linear and attention actually declare them. The
+    # image+text task adds the vision tower and the connector beside the decoder.
+    if vision is not None:
+        from slowq.vlm import required_tensors as vlm_required_tensors
+
+        expected = vlm_required_tensors(vision)
+    else:
+        expected = required_tensors(config)
+    plan = plan_tensor_names(expected, set(by_name), config.tensor_prefix)
+    return SourcePlan(
+        text=config,
+        by_name=by_name,
+        expected=expected,
+        plan=plan,
+        task=task,
+        vision=vision,
+    )
 
 
 def convert(
@@ -650,6 +960,7 @@ def convert(
     repo: str | None = None,
     revision: str | None = None,
     overwrite: bool = False,
+    task: str = TASK_AUTO,
 ) -> dict[str, Any]:
     """Write the SlowQ model directory and return the manifest.
 
@@ -660,7 +971,12 @@ def convert(
     """
     output = Path(output)
     check_output_is_installable(output, overwrite=overwrite)
-    config, by_name, expected = inspect_source(source)
+    resolved_task, evidence = detect_task(source, task)
+    plan = inspect_source(source, resolved_task)
+    print(
+        f"  task {resolved_task} ({evidence}); family {plan.family}",
+        file=sys.stderr,
+    )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(
@@ -671,13 +987,11 @@ def convert(
         manifest = convert_into(
             source,
             staging,
-            config=config,
-            by_name=by_name,
-            expected=expected,
+            plan=plan,
             repo=repo,
             revision=revision,
         )
-        validate_converted_model(staging, config)
+        validate_converted_model(staging, plan)
         install(staging, output, overwrite=overwrite)
         installed = True
     finally:
@@ -713,85 +1027,118 @@ def convert_into(
     source: Path,
     destination: Path,
     *,
-    config: ModelConfig,
-    by_name: dict[str, SafeTensorEntry],
-    expected: dict[str, tuple[int, ...]],
+    plan: SourcePlan,
     repo: str | None = None,
     revision: str | None = None,
 ) -> dict[str, Any]:
     """Write a complete, self-consistent model directory into ``destination``."""
+    config = plan.text
+    by_name = plan.by_name
+    expected = plan.expected
+    name_plan = plan.plan
     tensor_dir = destination / TENSOR_SUBDIR
     tensor_dir.mkdir(parents=True, exist_ok=True)
 
+    embed_name = embedding_tensor_name(config)
     aliases: dict[str, str] = {}
-    if config.tie_word_embeddings and TIED_OUTPUT_EMBEDDING_ALIAS in by_name:
-        # The checkpoint materialised the tied head anyway. Store one copy and
-        # record the alias — but only after proving the bytes really are equal.
-        if not tied_head_matches_embedding(
-            source, by_name[TIED_OUTPUT_EMBEDDING_ALIAS], by_name[EMBEDDING_TENSOR_NAME]
-        ):
-            raise ConfigError(
-                f"config.json sets tie_word_embeddings=true but "
-                f"{TIED_OUTPUT_EMBEDDING_ALIAS} differs from {EMBEDDING_TENSOR_NAME}. "
-                "Refusing to alias weights that are not actually shared."
-            )
-        aliases[TIED_OUTPUT_EMBEDDING_ALIAS] = EMBEDDING_TENSOR_NAME
+    #: Shard the tie comparison read, when the checkpoint stored a head at all.
+    head_shard: str | None = None
+    # ``lm_head`` sits outside the decoder, so it carries the same name in both
+    # source layouts and needs no entry in the plan.
+    head_entry = by_name.get(TIED_OUTPUT_EMBEDDING_ALIAS)
+    if plan.task != TASK_TEXT_EMBEDDING and config.tie_word_embeddings:
+        if head_entry is not None:
+            # The checkpoint materialised the tied head anyway, which makes the
+            # tie checkable rather than merely declared: refuse to alias weights
+            # that are not actually shared.
+            if not tied_head_matches_embedding(source, head_entry, by_name[name_plan[embed_name]]):
+                raise ConfigError(
+                    f"config.json sets tie_word_embeddings=true but "
+                    f"{TIED_OUTPUT_EMBEDDING_ALIAS} differs from {embed_name}. "
+                    "Refusing to alias weights that are not actually shared."
+                )
+            head_shard = head_entry.file
+            note = "tied and byte-identical; storing one copy"
+        else:
+            # SmolLM2 and Qwen2.5 never store the head, so there is nothing to
+            # compare. ``tie_word_embeddings`` is the same evidence HF uses to
+            # build the shared module (_tied_weights_keys), and the alias only
+            # records what loading already does: output_embedding_name() points
+            # a tied model at the embedding matrix. Without it, a converted
+            # directory would answer weights.get("lm_head.weight") differently
+            # depending on how the upstream export was saved.
+            note = "tied per config.json; the checkpoint stores no head"
+        aliases[TIED_OUTPUT_EMBEDDING_ALIAS] = embed_name
         print(
-            f"  {TIED_OUTPUT_EMBEDDING_ALIAS} == {EMBEDDING_TENSOR_NAME} "
-            "(tied; storing one copy)",
+            f"  {TIED_OUTPUT_EMBEDDING_ALIAS} -> {embed_name} ({note})",
             file=sys.stderr,
         )
 
-    stored_names = {name for name in expected if name in by_name}
     written: list[dict[str, Any]] = []
     source_files: dict[str, str] = {}
 
-    grouped: dict[str, list[SafeTensorEntry]] = {}
-    for entry in by_name.values():
-        grouped.setdefault(entry.file, []).append(entry)
+    grouped: dict[str, list[tuple[str, SafeTensorEntry]]] = {}
+    for canonical, source_name in name_plan.items():
+        entry = by_name[source_name]
+        grouped.setdefault(entry.file, []).append((canonical, entry))
 
-    total = len(stored_names)
+    total = len(name_plan)
     done = 0
     for filename in sorted(grouped):
         path = source / filename
         source_files[filename] = sha256_file(path)
         with mapped(path) as blob:
-            for entry in sorted(grouped[filename], key=lambda item: item.name):
-                if entry.name not in stored_names:
-                    continue
+            for canonical, entry in sorted(grouped[filename], key=lambda item: item[0]):
                 array = convert_tensor(entry, blob)
-                if tuple(array.shape) != expected[entry.name]:
+                if tuple(array.shape) != expected[canonical]:
                     raise SlowQError(
-                        f"tensor {entry.name!r} has shape {tuple(array.shape)}, "
-                        f"expected {expected[entry.name]}"
+                        f"tensor {canonical!r} has shape {tuple(array.shape)}, "
+                        f"expected {expected[canonical]}"
                     )
-                relative = f"{entry.name}.npy"
+                relative = f"{canonical}.npy"
                 np.save(tensor_dir / relative, array)
-                written.append(
-                    {
-                        "name": entry.name,
-                        "file": relative,
-                        "shape": list(array.shape),
-                        "dtype": "float32",
-                        "source_dtype": entry.dtype,
-                    }
-                )
+                record: dict[str, Any] = {
+                    "name": canonical,
+                    "file": relative,
+                    "shape": list(array.shape),
+                    "dtype": "float32",
+                    "source_dtype": entry.dtype,
+                }
+                if entry.name != canonical:
+                    # A rename is part of the record, not a silent rewrite.
+                    record["source_name"] = entry.name
+                written.append(record)
                 del array
                 done += 1
                 print(
-                    f"  [{done}/{total}] {entry.name} {tuple(entry.shape)} "
-                    f"{entry.dtype} -> float32",
+                    f"  [{done}/{total}] {canonical} {tuple(entry.shape)} "
+                    f"{entry.dtype} -> float32"
+                    + ("" if entry.name == canonical else f"  (from {entry.name})"),
                     file=sys.stderr,
                     flush=True,
                 )
 
     written.sort(key=lambda item: item["name"])
 
+    if head_shard is not None and head_shard not in source_files:
+        # The head is not part of the plan, so a sharded checkpoint can keep it
+        # in a shard no planned tensor came from. That shard was still read — to
+        # compare it against the embedding — and a provenance record that omits
+        # it would let it change unnoticed. Qwen3-1.7B is exactly this case:
+        # lm_head.weight sits alone in shard 2.
+        source_files[head_shard] = sha256_file(source / head_shard)
+
     manifest = {
         "format_version": SUPPORTED_FORMAT_VERSION,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "tool": "tools/convert_model.py",
         "compute_dtype": "float32",
+        # Recorded rather than re-derived at load time: an embedding checkpoint
+        # declares the same architectures as the chat model it came from, and an
+        # image+text one nests a decoder whose family (llama) says nothing about
+        # the vision tower beside it.
+        "task": plan.task,
+        "model_family": plan.family,
         "source": {
             "repo_id": repo or f"local:{source}",
             "revision": revision,
@@ -804,15 +1151,30 @@ def convert_into(
         "tensors": written,
         "aliases": aliases,
         "tokenizer_files": [
-            name for name in TOKENIZER_FILES if (source / name).is_file()
+            name
+            for name in (*TOKENIZER_FILES, *EXTRA_TOKENIZER_FILES)
+            if (source / name).is_file()
         ],
+        "processor_files": [name for name in PROCESSOR_FILES if (source / name).is_file()],
     }
 
-    for name in (CONFIG_FILE, GENERATION_CONFIG_FILE, *TOKENIZER_FILES):
+    # Which files are mandatory follows from the task, not from one global list:
+    # an embedding checkpoint has no use for a chat template, and only an
+    # image+text one needs the processor settings that define its pixel pipeline.
+    mandatory = {CONFIG_FILE, "tokenizer.json", "tokenizer_config.json"}
+    if plan.task == TASK_IMAGE_TEXT_GENERATION:
+        mandatory.update(PROCESSOR_FILES)
+    for name in (
+        CONFIG_FILE,
+        GENERATION_CONFIG_FILE,
+        *TOKENIZER_FILES,
+        *EXTRA_TOKENIZER_FILES,
+        *PROCESSOR_FILES,
+    ):
         source_file = source / name
         if source_file.is_file():
             shutil.copyfile(source_file, destination / name)
-        elif name in (CONFIG_FILE, "tokenizer.json", "tokenizer_config.json"):
+        elif name in mandatory:
             raise SlowQError(f"{source_file} is required but missing")
 
     (destination / MANIFEST_FILENAME).write_text(
@@ -821,18 +1183,22 @@ def convert_into(
     return manifest
 
 
-def validate_converted_model(directory: Path, config: ModelConfig) -> None:
+def validate_converted_model(directory: Path, plan: SourcePlan) -> None:
     """Load the directory back the way inference will, before it becomes a model.
 
-    ``check_complete`` alone is not enough: it only reads the manifest, so a
+    ``check_names`` alone is not enough: it only reads the manifest, so a
     directory whose ``.npy`` files are missing, truncated or mis-shaped would
     pass. Mapping every tensor here is cheap (only the headers are read) and
     catches exactly that.
+
+    A chat template is required only where the task uses one. The official
+    Qwen3-Embedding recipe tokenises raw text, so refusing an embedding
+    conversion for a missing template would be a false failure.
     """
     from slowq.tokenizer import Tokenizer
 
     weights = Weights.from_directory(directory)
-    weights.check_complete(config)
+    weights.check_names(plan.expected)
     for spec in weights.iter_specs():
         weights.get(spec.name)
     on_disk = {path.name for path in (directory / TENSOR_SUBDIR).iterdir()}
@@ -842,7 +1208,16 @@ def validate_converted_model(directory: Path, config: ModelConfig) -> None:
             f"{directory}/tensors holds files the manifest does not declare: "
             f"{', '.join(sorted(on_disk - declared)[:4])}"
         )
-    Tokenizer.from_directory(directory)
+    Tokenizer.from_directory(
+        directory, require_chat_template=plan.task != TASK_TEXT_EMBEDDING
+    )
+    if plan.vision is not None:
+        # The config that was built from the *source* is not evidence about the
+        # directory we just wrote: re-read it from there, so a missing or altered
+        # processor file fails the conversion instead of the first image request.
+        from slowq.vlm import SmolVLMConfig
+
+        SmolVLMConfig.from_directory(directory)
 
 
 def install(staging: Path, output: Path, *, overwrite: bool) -> None:
@@ -894,9 +1269,13 @@ def install(staging: Path, output: Path, *, overwrite: bool) -> None:
 def summarise(manifest: dict[str, Any], output: Path) -> str:
     tensors = manifest["tensors"]
     elements = sum(int(np.prod(t["shape"])) for t in tensors)
+    renamed = sum(1 for t in tensors if t.get("source_name"))
     return (
         f"wrote {output}\n"
-        f"  tensors      {len(tensors)} stored, {len(manifest['aliases'])} shared via alias\n"
+        f"  task         {manifest['task']} ({manifest['model_family']} family)\n"
+        f"  tensors      {len(tensors)} stored, {len(manifest['aliases'])} shared via alias"
+        + (f", {renamed} renamed to the canonical layout" if renamed else "")
+        + "\n"
         f"  parameters   {elements:,} unique\n"
         f"  fp32 size    {elements * 4 / 2**30:.2f} GiB logical\n"
         f"  revision     {manifest['source'].get('revision')}\n"
@@ -909,7 +1288,7 @@ def summarise(manifest: dict[str, Any], output: Path) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Convert an official Qwen3 checkpoint to SlowQ's offline FP32 format.",
+        description="Convert an official checkpoint to SlowQ's offline FP32 format.",
     )
     origin = parser.add_mutually_exclusive_group()
     origin.add_argument(
@@ -926,7 +1305,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--revision",
         default=None,
-        help=f"pin a commit sha (default: {DEFAULT_REVISION[:12]}… for the default repo)",
+        help="pin a commit sha. Any repo other than the default resolves its own "
+        "current commit and records it in the manifest; the pinned default exists "
+        f"only so Qwen3-0.6B reproduces ({DEFAULT_REVISION[:12]}…).",
+    )
+    parser.add_argument(
+        "--task",
+        choices=TASK_CHOICES,
+        default=TASK_AUTO,
+        help="what the checkpoint is for. 'auto' decides from the files present, "
+        "not from the repo's name: the sentence-transformers marker files make it "
+        "an embedding model, and a config that nests a vision_config beside a text "
+        "decoder plus the processor files makes it an image+text one. An explicit "
+        "value is still checked against those files. Default: %(default)s",
     )
     parser.add_argument(
         "--download-dir",
@@ -948,6 +1339,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="reuse an existing snapshot without contacting the network",
     )
     return parser
+
+
+NEXT_STEP_BY_TASK = {
+    TASK_TEXT_GENERATION: (
+        "next: python -m slowq inspect --model {out}\n"
+        "      python -m slowq generate --model {out} --prompt 你好"
+    ),
+    TASK_TEXT_EMBEDDING: (
+        "next: python -m slowq embed --model {out} --query '什么是慢炖？' \\\n"
+        "          --document '慢炖是一个用 NumPy 在 CPU 上跑小模型的推理框架。'"
+    ),
+    TASK_IMAGE_TEXT_GENERATION: (
+        "next: python -m slowq inspect --model {out}\n"
+        "      python -m slowq vlm --model {out} --image photo.jpg \\\n"
+        "          --question 'Describe this image.'"
+    ),
+}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -988,14 +1396,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         started = time.perf_counter()
         print(f"converting {source} -> {output}", file=sys.stderr)
         manifest = convert(
-            source, output, repo=repo, revision=revision, overwrite=args.overwrite
+            source,
+            output,
+            repo=repo,
+            revision=revision,
+            overwrite=args.overwrite,
+            task=args.task,
         )
         elapsed = time.perf_counter() - started
         print(summarise(manifest, output), file=sys.stderr)
         print(f"  took {elapsed:.1f} s", file=sys.stderr)
         print(
-            "\nnext: python -m slowq inspect --model "
-            f"{output}\n      python -m slowq generate --model {output} --prompt 你好",
+            "\n" + NEXT_STEP_BY_TASK[manifest["task"]].format(out=output),
             file=sys.stderr,
         )
     except SlowQError as exc:

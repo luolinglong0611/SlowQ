@@ -1,4 +1,4 @@
-"""Config parsing and the v0.1 support-range checks."""
+"""Config parsing, per-family rules, and the support-range checks."""
 
 from __future__ import annotations
 
@@ -95,9 +95,17 @@ def test_rejects_a_missing_head_dim(hf_config: dict):
         ModelConfig.from_hf_config(hf_config)
 
 
-def test_rejects_another_model_type(hf_config: dict):
+def test_rejects_an_unknown_model_type(hf_config: dict):
+    hf_config["model_type"] = "mistral"
+    hf_config["architectures"] = ["MistralForCausalLM"]
+    with pytest.raises(ConfigError, match="not supported"):
+        ModelConfig.from_hf_config(hf_config)
+
+
+def test_rejects_an_architecture_that_disagrees_with_the_model_type(hf_config: dict):
+    """A qwen2 model_type wearing Qwen3's architecture name is a red flag, not a hint."""
     hf_config["model_type"] = "qwen2"
-    with pytest.raises(ConfigError, match="only supports 'qwen3'"):
+    with pytest.raises(ConfigError, match="does not match model_type"):
         ModelConfig.from_hf_config(hf_config)
 
 
@@ -116,11 +124,10 @@ def test_rejects_a_different_activation(hf_config: dict):
 @pytest.mark.parametrize(
     "key,value",
     [
-        ("attention_bias", True),
         ("use_sliding_window", True),
-        ("sliding_window", 128),
         ("rope_scaling", {"type": "linear", "factor": 2.0}),
         ("rope_parameters", {"rope_theta": 5000000.0}),
+        ("rope_interleaved", True),
     ],
 )
 def test_rejects_unimplemented_features_that_would_change_numerics(
@@ -133,7 +140,194 @@ def test_rejects_unimplemented_features_that_would_change_numerics(
 
 def test_accepts_explicitly_disabled_optional_features(hf_config: dict):
     hf_config.update(attention_bias=False, use_sliding_window=False, sliding_window=None)
-    assert ModelConfig.from_hf_config(hf_config).attention_bias is False
+    config = ModelConfig.from_hf_config(hf_config)
+    assert config.qkv_bias is False
+    assert config.o_proj_bias is False
+    assert config.sliding_window is None
+
+
+# --------------------------------------------------------------------------- #
+# per-family bias / norm / head_dim rules
+# --------------------------------------------------------------------------- #
+
+
+def test_qwen3_reads_its_attention_bias_from_the_config(hf_config: dict):
+    """Qwen3Attention passes ``bias=config.attention_bias`` to all four Linears."""
+    hf_config["attention_bias"] = True
+    config = ModelConfig.from_hf_config(hf_config)
+    assert config.family == "qwen3"
+    assert config.qkv_bias is True
+    assert config.o_proj_bias is True
+    assert config.mlp_bias is False, "Qwen3MLP builds its Linears without a bias"
+    assert config.qk_norm is True
+
+
+def test_qwen3_refuses_to_derive_head_dim(hf_config: dict):
+    """Qwen3 sets head_dim independently of hidden_size, so the fallback is wrong."""
+    del hf_config["head_dim"]
+    with pytest.raises(ConfigError, match="refuses to guess"):
+        ModelConfig.from_hf_config(hf_config)
+
+
+def qwen2_config(**overrides) -> dict:
+    base = {
+        "model_type": "qwen2",
+        "architectures": ["Qwen2ForCausalLM"],
+        "hidden_size": 896,
+        "intermediate_size": 4864,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 14,
+        "num_key_value_heads": 2,
+        "vocab_size": 49408,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1000000.0,
+        "max_position_embeddings": 32768,
+        "hidden_act": "silu",
+        "tie_word_embeddings": True,
+        "use_sliding_window": False,
+        "sliding_window": 32768,
+    }
+    base.update(overrides)
+    return base
+
+
+def llama_config(**overrides) -> dict:
+    base = {
+        "model_type": "llama",
+        "architectures": ["LlamaForCausalLM"],
+        "hidden_size": 576,
+        "intermediate_size": 1536,
+        "num_hidden_layers": 30,
+        "num_attention_heads": 9,
+        "num_key_value_heads": 3,
+        "vocab_size": 49152,
+        "rms_norm_eps": 1e-5,
+        "rope_theta": 10000.0,
+        "max_position_embeddings": 8192,
+        "hidden_act": "silu",
+        "tie_word_embeddings": True,
+        "attention_bias": False,
+        "mlp_bias": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_qwen2_always_biases_qkv_and_never_biases_o_proj():
+    """Qwen2Attention hard-codes ``bias=True`` for q/k/v and ``bias=False`` for o."""
+    config = ModelConfig.from_hf_config(qwen2_config())
+    assert config.family == "qwen2"
+    assert config.qkv_bias is True
+    assert config.o_proj_bias is False
+    assert config.mlp_bias is False
+    assert config.qk_norm is False, "qwen2 has no per-head Q/K RMSNorm"
+
+
+def test_qwen2_ignores_an_attention_bias_key_that_would_change_nothing():
+    """The config key does not exist for qwen2; a stray value must not flip anything."""
+    config = ModelConfig.from_hf_config(qwen2_config(attention_bias=False))
+    assert config.qkv_bias is True
+    assert config.o_proj_bias is False
+
+
+def test_qwen2_derives_head_dim_when_the_config_omits_it():
+    config = ModelConfig.from_hf_config(qwen2_config())
+    assert "head_dim" not in qwen2_config()
+    assert config.head_dim == 896 // 14 == 64
+
+
+def test_qwen2_keeps_a_sliding_window_the_mask_actually_applies():
+    """Qwen2Model builds its causal mask from ``config.sliding_window`` whenever it
+    is not None — independent of ``use_sliding_window``. Refusing the config would
+    reject every Qwen2.5 checkpoint; ignoring the window would be wrong past it."""
+    config = ModelConfig.from_hf_config(qwen2_config())
+    assert config.sliding_window == 32768
+    assert config.validate_max_context(32768) == 32768
+
+
+def test_a_context_past_the_sliding_window_is_refused_even_though_it_fits_the_rope():
+    """Qwen2.5 publishes sliding_window == max_position_embeddings, so the two
+    checks coincide there. A narrower window must still be the binding one."""
+    config = ModelConfig.from_hf_config(qwen2_config(sliding_window=1024))
+    assert config.max_position_embeddings == 32768
+    assert config.validate_max_context(1024) == 1024
+    with pytest.raises(ConfigError, match="sliding_window"):
+        config.validate_max_context(1025)
+
+
+def test_llama_reads_both_bias_flags_from_the_config():
+    config = ModelConfig.from_hf_config(llama_config())
+    assert config.family == "llama"
+    assert config.qkv_bias is False
+    assert config.o_proj_bias is False
+    assert config.mlp_bias is False
+    assert config.qk_norm is False
+
+    biased = ModelConfig.from_hf_config(llama_config(attention_bias=True, mlp_bias=True))
+    assert biased.qkv_bias is True
+    assert biased.o_proj_bias is True
+    assert biased.mlp_bias is True
+
+
+def test_llama_has_no_sliding_window_to_honour():
+    """LlamaModel's mask never reads ``sliding_window``, so storing one would make
+    validate_max_context reject a context the reference handles fine."""
+    config = ModelConfig.from_hf_config(llama_config(sliding_window=64))
+    assert config.sliding_window is None
+    assert config.validate_max_context(8192) == 8192
+
+
+def test_llama_derives_head_dim_and_checks_divisibility():
+    assert ModelConfig.from_hf_config(llama_config()).head_dim == 576 // 9 == 64
+    with pytest.raises(ConfigError, match="divisible"):
+        ModelConfig.from_hf_config(llama_config(hidden_size=577))
+
+
+def test_llama_keeps_an_explicit_head_dim():
+    config = ModelConfig.from_hf_config(llama_config(head_dim=128))
+    assert config.head_dim == 128
+    assert config.q_proj_out == 9 * 128
+
+
+def test_a_nested_decoder_is_accepted_for_the_image_text_task():
+    """SmolVLM's ``text_config`` is an ordinary llama decoder, so the image+text
+    task must not be rejected here: ``slowq.vlm`` hands this method the nested
+    config and adds the vision tower beside it."""
+    config = ModelConfig.from_hf_config(
+        llama_config(),
+        task="image-text-generation",
+        tensor_prefix="model.text_model",
+        where="config.json:text_config",
+    )
+    assert config.task == "image-text-generation"
+    assert config.family == "llama"
+    assert config.tensor_prefix == "model.text_model"
+
+
+def test_the_top_level_idefics3_config_is_not_a_text_decoder():
+    """What *is* refused: the wrapper config, whose ``model_type`` names no
+    decoder family. Naming ``slowq.vlm`` in the message is the point."""
+    wrapper = {
+        "model_type": "idefics3",
+        "architectures": ["Idefics3ForConditionalGeneration"],
+        "image_token_id": 49190,
+        "scale_factor": 4,
+        "text_config": llama_config(),
+        "vision_config": {"hidden_size": 768},
+    }
+    with pytest.raises(ConfigError, match="slowq.vlm"):
+        ModelConfig.from_hf_config(wrapper, task="image-text-generation")
+
+
+def test_the_embedding_task_is_recorded_on_the_config():
+    config = ModelConfig.from_hf_config(qwen2_config(), task="text-embedding")
+    assert config.task == "text-embedding"
+    assert config.is_generative is False
+
+
+def test_an_unknown_task_is_rejected():
+    with pytest.raises(ConfigError, match="not one of"):
+        ModelConfig.from_hf_config(qwen2_config(), task="text-classification")
 
 
 @pytest.mark.parametrize(

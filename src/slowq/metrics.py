@@ -12,6 +12,13 @@ Definitions used everywhere in SlowQ (also documented in docs/architecture.md):
 ``tokenize_seconds``
     Chat-template rendering plus BPE encoding of the prompt.
 
+``vision_encode_seconds``
+    Image+text requests only: running every frame of the image through the vision
+    tower and the connector. It is part of time-to-first-token and is reported
+    separately because it is not prefill — for a 17-frame image it is by far the
+    largest single cost of the request. Resizing and normalising the frames
+    happens earlier, in prompt construction, and is not included here.
+
 ``prefill_seconds``
     Wall time of all prefill forwards (every chunk), including the KV writes.
 
@@ -137,6 +144,7 @@ class GenerationMetrics:
     """Per-request statistics. All durations are seconds from ``time.perf_counter``."""
 
     tokenize_seconds: float = 0.0
+    vision_encode_seconds: float = 0.0
     prefill_seconds: float = 0.0
     decode_seconds: float = 0.0
     first_token_seconds: float = 0.0
@@ -167,24 +175,34 @@ class GenerationMetrics:
         return self.prompt_tokens / self.prefill_seconds
 
     def report(self) -> list[tuple[str, str]]:
-        return [
+        rows = [
             ("stop reason", self.stop_reason),
             ("prompt tokens", f"{self.prompt_tokens} ({self.prefill_chunks} chunk(s))"),
             ("generated tokens", str(self.generated_tokens)),
             ("tokenize", f"{self.tokenize_seconds * 1e3:.1f} ms"),
-            ("prefill", f"{self.prefill_seconds * 1e3:.1f} ms"),
-            ("first token latency", f"{self.first_token_seconds * 1e3:.1f} ms"),
-            ("decode", f"{self.decode_seconds * 1e3:.1f} ms"),
-            ("decode speed", f"{self.decode_tokens_per_second:.2f} tok/s"),
-            ("total", f"{self.total_seconds * 1e3:.1f} ms"),
-            ("weights (logical)", human_bytes(self.weight_logical_bytes)),
-            ("KV cache (allocated)", human_bytes(self.kv_allocated_bytes)),
-            ("peak RSS", human_bytes(self.peak_rss_bytes)),
         ]
+        if self.vision_encode_seconds > 0:
+            # Only image+text requests have one, so a text run's report is
+            # unchanged rather than gaining a permanent row of zeros.
+            rows.append(("vision encode", f"{self.vision_encode_seconds * 1e3:.1f} ms"))
+        rows.extend(
+            [
+                ("prefill", f"{self.prefill_seconds * 1e3:.1f} ms"),
+                ("first token latency", f"{self.first_token_seconds * 1e3:.1f} ms"),
+                ("decode", f"{self.decode_seconds * 1e3:.1f} ms"),
+                ("decode speed", f"{self.decode_tokens_per_second:.2f} tok/s"),
+                ("total", f"{self.total_seconds * 1e3:.1f} ms"),
+                ("weights (logical)", human_bytes(self.weight_logical_bytes)),
+                ("KV cache (allocated)", human_bytes(self.kv_allocated_bytes)),
+                ("peak RSS", human_bytes(self.peak_rss_bytes)),
+            ]
+        )
+        return rows
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "tokenize_seconds": self.tokenize_seconds,
+            "vision_encode_seconds": self.vision_encode_seconds,
             "prefill_seconds": self.prefill_seconds,
             "decode_seconds": self.decode_seconds,
             "first_token_seconds": self.first_token_seconds,

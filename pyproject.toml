@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "slowq"
-version = "0.1.0"
-description = "慢炖 · SlowQ — Qwen3-0.6B CPU inference in readable Python + NumPy"
+version = "0.2.0"
+description = "慢炖 · SlowQ — small-model CPU inference in readable Python + NumPy"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "SlowQ contributors" }]
-keywords = ["llm", "inference", "numpy", "qwen3", "cpu"]
+keywords = ["llm", "inference", "numpy", "qwen3", "qwen2", "llama", "cpu"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Intended Audience :: Developers",
@@ -29,6 +29,12 @@ dependencies = [
 dev = [
   "pytest>=8.0",
 ]
+# Only needed to read an image with `slowq vlm` / `slowq.vlm`. Deliberately not
+# a runtime dependency: a text-only install must stay numpy + tokenizers + Jinja2.
+# Pillow decodes and resizes; every pixel after that is NumPy.
+vision = [
+  "Pillow>=10.0",
+]
 # Only needed by tools/validate_reference.py. Deliberately kept out of the
 # runtime import graph; see docs/architecture.md "Dependency boundaries".
 ref = [
@@ -36,6 +42,7 @@ ref = [
   "transformers==4.51.3",
   "safetensors>=0.4",
   "huggingface_hub>=0.25",
+  "Pillow>=10.0",
 ]
 
 [project.scripts]
@@ -56,5 +63,5 @@ where = ["src"]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 markers = [
-  "integration: real Qwen3-0.6B tests; skipped unless SLOWQ_MODEL_DIR points at a converted model directory",
+  "integration: real-weight tests; skipped unless the environment names a converted model directory (see tests/real_models.py)",
 ]

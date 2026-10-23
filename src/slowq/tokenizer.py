@@ -3,15 +3,26 @@
 Two deliberate choices:
 
 * The vocabulary comes from ``tokenizers`` + the official ``tokenizer.json``; we
-  never reimplement BPE. Qwen's post-processor is ``ByteLevel`` with
-  ``add_prefix_space=False``, so ``add_special_tokens`` adds nothing — we pass
-  ``False`` anyway to make "the chat template emits every special token itself"
-  explicit and to rule out double-adding ``<|fim_prefix|>``/``<|fim_middle|>``.
+  never reimplement BPE. ``encode`` defaults to ``add_special_tokens=False``
+  because the generation path renders a chat template first, and that is how
+  ``transformers`` tokenises a template's output — the template emits every
+  special token itself, so re-running the post-processor would risk doubling
+  ``<|fim_prefix|>``/``<|fim_middle|>``. For the three generation checkpoints
+  SlowQ supports the flag makes no difference either way (measured, per
+  checkpoint). It does matter for ``Qwen3-Embedding-0.6B``, whose
+  post-processor appends ``<|fim_suffix|>``; the official embedding recipe calls
+  the tokenizer with its default, so :mod:`slowq.embedding` passes ``True``.
 * The prompt is rendered with Jinja2 from the ``chat_template`` string in
   ``tokenizer_config.json``, using the same environment settings as
   ``transformers`` (``trim_blocks`` + ``lstrip_blocks`` matter: the official
   template is indented). We do not hand-write a template and do not guess
-  BOS/EOS.
+  BOS/EOS — each family (qwen3, qwen2, llama) ships its own, and SlowQ uses
+  whichever the converted directory carries.
+
+The chat template is optional at load time only for tasks that never chat:
+``EmbeddingEngine`` passes ``require_chat_template=False`` because the official
+Qwen3-Embedding recipe tokenises raw text. ``render_chat`` then raises rather
+than inventing a format.
 """
 
 from __future__ import annotations
@@ -31,8 +42,8 @@ from .errors import ConfigError, UnsupportedInputError
 TOKENIZER_FILE = "tokenizer.json"
 TOKENIZER_CONFIG_FILE = "tokenizer_config.json"
 
-#: v0.1 renders text-only conversations. ``enable_thinking=False`` selects the
-#: non-thinking branch of the official Qwen3 template.
+#: Text-only conversations. ``enable_thinking=False`` selects the non-thinking
+#: branch of the official Qwen3 template.
 SUPPORTED_ROLES = ("system", "user", "assistant")
 DEFAULT_ENABLE_THINKING = False
 
@@ -49,8 +60,10 @@ class ChatMessage:
 def normalize_messages(messages: Iterable[Mapping[str, Any] | ChatMessage]) -> list[ChatMessage]:
     """Validate and convert user-supplied messages.
 
-    Rejects anything v0.1 cannot represent: tool calls, tool results, and
-    structured/multimodal content (a list of parts instead of a string).
+    Rejects anything the text path cannot represent: tool calls, tool results,
+    and structured/multimodal content (a list of parts instead of a string).
+    ``slowq.vlm`` builds its own message parts and renders them through
+    :meth:`Tokenizer.render_template` instead.
     """
     normalized: list[ChatMessage] = []
     materialized = list(messages)
@@ -71,27 +84,26 @@ def normalize_messages(messages: Iterable[Mapping[str, Any] | ChatMessage]) -> l
         role = raw.get("role")
         if role not in SUPPORTED_ROLES:
             raise UnsupportedInputError(
-                f"{where}.role={role!r} is not supported in v0.1; "
-                f"expected one of {list(SUPPORTED_ROLES)}. Tool calls and tool "
-                "results are out of scope."
+                f"{where}.role={role!r} is not supported; expected one of "
+                f"{list(SUPPORTED_ROLES)}. Tool calls and tool results are out "
+                "of scope."
             )
         for rejected in ("tool_calls", "function_call"):
             if raw.get(rejected):
                 raise UnsupportedInputError(
-                    f"{where}.{rejected} is not supported in SlowQ v0.1."
+                    f"{where}.{rejected} is not supported by SlowQ."
                 )
         content = raw.get("content")
         if not isinstance(content, str):
             raise UnsupportedInputError(
                 f"{where}.content must be a plain string, got {type(content).__name__}. "
-                "SlowQ v0.1 is text-only: images, audio and multi-part content "
-                "are not supported."
+                "Use slowq.vlm.VisionEngine for image + text messages."
             )
         unknown = set(raw) - {"role", "content"}
         if unknown:
             raise UnsupportedInputError(
-                f"{where} has unsupported field(s) {sorted(unknown)}; v0.1 accepts "
-                "only 'role' and 'content'."
+                f"{where} has unsupported field(s) {sorted(unknown)}; only 'role' "
+                "and 'content' are accepted."
             )
         normalized.append(ChatMessage(role=str(role), content=content))
     return normalized
@@ -138,23 +150,39 @@ class IncrementalTextDecoder:
 
 
 class Tokenizer:
-    """Thin wrapper over ``tokenizers`` plus the official Qwen3 chat template."""
+    """Thin wrapper over ``tokenizers`` plus the checkpoint's chat template."""
 
     def __init__(
         self,
         tokenizer: _HFTokenizer,
-        chat_template: str,
+        chat_template: str | None,
         special_token_ids: Mapping[str, int | None],
     ) -> None:
         self._tokenizer = tokenizer
         self._chat_template = chat_template
-        self._template = self._compile_template(chat_template)
+        self._template = (
+            self._compile_template(chat_template) if chat_template is not None else None
+        )
         self.special_token_ids = dict(special_token_ids)
+
+    @property
+    def has_chat_template(self) -> bool:
+        return self._template is not None
 
     # ---- construction -------------------------------------------------------
 
     @classmethod
-    def from_directory(cls, model_dir: str | Path) -> "Tokenizer":
+    def from_directory(
+        cls, model_dir: str | Path, *, require_chat_template: bool = True
+    ) -> "Tokenizer":
+        """Load ``tokenizer.json`` + ``tokenizer_config.json`` from a converted dir.
+
+        ``require_chat_template=False`` is for tasks that never render a chat:
+        the official Qwen3-Embedding recipe tokenises raw text (with a
+        ``Instruct: ...\\nQuery:...`` prefix for queries), so an embedding
+        checkpoint that ships without a template is still perfectly usable. We
+        then keep ``chat_template=None`` and ``render_chat`` refuses to guess.
+        """
         root = Path(model_dir)
         tokenizer_path = root / TOKENIZER_FILE
         config_path = root / TOKENIZER_CONFIG_FILE
@@ -166,10 +194,12 @@ class Tokenizer:
         tokenizer_config = json.loads(config_path.read_text(encoding="utf-8"))
         chat_template = tokenizer_config.get("chat_template")
         if not isinstance(chat_template, str) or not chat_template.strip():
-            raise ConfigError(
-                f"{config_path} has no usable 'chat_template'. SlowQ will not "
-                "guess a prompt format."
-            )
+            if require_chat_template:
+                raise ConfigError(
+                    f"{config_path} has no usable 'chat_template'. SlowQ will not "
+                    "guess a prompt format."
+                )
+            chat_template = None
 
         tokenizer = _HFTokenizer.from_file(str(tokenizer_path))
         tokenizer.no_truncation()
@@ -240,17 +270,42 @@ class Tokenizer:
         add_generation_prompt: bool = True,
         enable_thinking: bool = DEFAULT_ENABLE_THINKING,
     ) -> str:
-        """Render the official Qwen3 chat template.
+        """Render the checkpoint's own chat template.
 
-        ``enable_thinking=False`` (the v0.1 default) makes the template emit the
-        empty ``<think>\n\n</think>`` marker, i.e. plain non-thinking mode.
+        ``enable_thinking=False`` (the default) selects the non-thinking branch
+        of Qwen3's official template; other families' templates ignore it.
         """
         normalized = normalize_messages(messages)
-        rendered = self._template.render(
-            messages=[m.to_template_dict() for m in normalized],
+        return self.render_template(
+            [m.to_template_dict() for m in normalized],
             add_generation_prompt=add_generation_prompt,
             enable_thinking=enable_thinking,
             tools=[],
+        )
+
+    def render_template(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        add_generation_prompt: bool = True,
+        **context: Any,
+    ) -> str:
+        """Render already-prepared template variables, without validation.
+
+        This is the escape hatch for callers that must build non-text message
+        parts themselves — ``slowq.vlm`` expands one image into the checkpoint's
+        crop-placeholder string before rendering.
+        """
+        if self._template is None:
+            raise ConfigError(
+                "this converted model directory has no chat template, so SlowQ "
+                "cannot render a chat prompt. Tokenise the text yourself and use "
+                "the *_ids entry points; the official Qwen3-Embedding recipe does "
+                "exactly that."
+            )
+        rendered = self._template.render(
+            messages=list(messages),
+            add_generation_prompt=add_generation_prompt,
+            **context,
         )
         if not isinstance(rendered, str):
             raise ConfigError("chat template did not render to a string")
@@ -283,10 +338,15 @@ class Tokenizer:
         return self._tokenizer.id_to_token(token_id)
 
     def describe(self) -> list[tuple[str, Any]]:
+        template = (
+            f"{len(self._chat_template)} chars from tokenizer_config.json"
+            if self._chat_template
+            else "none (this checkpoint ships no chat template)"
+        )
         return [
             ("backend", f"tokenizers {_TOKENIZERS_VERSION}"),
             ("vocab size (incl. added tokens)", self.vocab_size),
-            ("chat template", f"{len(self._chat_template)} chars from tokenizer_config.json"),
+            ("chat template", template),
             ("default enable_thinking", DEFAULT_ENABLE_THINKING),
             *self.special_token_ids.items(),
         ]

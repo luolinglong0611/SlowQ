@@ -1,9 +1,9 @@
 """Exception hierarchy for SlowQ.
 
 One base class plus one per way SlowQ refuses on purpose: unsupported model
-configuration, bad model data, an input feature v0.1 lacks, an illegal sampling
-request, and a request that does not fit the context window. Anything else is a
-bug and should stay a plain Python exception.
+configuration, bad model data, an input feature SlowQ does not implement, an
+illegal sampling request, and a request that does not fit the context window.
+Anything else is a bug and should stay a plain Python exception.
 """
 
 from __future__ import annotations
@@ -22,10 +22,11 @@ class WeightError(SlowQError):
 
 
 class UnsupportedInputError(SlowQError):
-    """The request uses a feature v0.1 does not implement.
+    """The request uses a feature SlowQ does not implement.
 
-    Raised for tool calls, tool results, and structured/multimodal content so a
-    caller gets an explanation instead of silently dropped fields.
+    Raised for tool calls, tool results, and content the loaded engine cannot
+    represent, so a caller gets an explanation instead of silently dropped
+    fields.
     """
 
 

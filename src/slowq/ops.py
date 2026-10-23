@@ -1,17 +1,24 @@
-"""Numerical operators, written to mirror ``transformers`` Qwen3 semantics.
+"""Numerical operators, written to mirror ``transformers`` semantics.
 
 Every function takes and returns FP32. Two rules keep us out of FP64 by
 accident: inputs are coerced with ``np.float32`` scalars rather than Python
 floats, and no operator ever calls ``.astype(np.float64)``.
 
-Reference (transformers 4.51.x, ``models/qwen3/modeling_qwen3.py``):
+Reference (transformers 4.51.x):
 
-* ``Qwen3RMSNorm``   -- variance in fp32, ``weight * (x * rsqrt(var + eps))``
-* ``Qwen3RotaryEmbedding`` -- ``inv_freq = 1 / theta ** (arange(0, d, 2) / d)``,
-  ``emb = cat(freqs, freqs)``, ``cos/sin`` cast back to the activation dtype
+* ``Qwen3RMSNorm`` / ``LlamaRMSNorm`` -- variance in fp32,
+  ``weight * (x * rsqrt(var + eps))``
+* ``*RotaryEmbedding`` -- ``inv_freq = 1 / theta ** (arange(0, d, 2) / d)``,
+  ``emb = cat(freqs, freqs)``, ``cos/sin`` cast back to the activation dtype.
+  Identical in the qwen3, qwen2 and llama modules, and none of them reads
+  ``rope_interleaved``, so one implementation covers all three families.
 * ``apply_rotary_pos_emb`` -- ``x * cos + rotate_half(x) * sin`` with
   ``rotate_half`` splitting the head into two halves (not interleaved pairs)
 * attention scaling -- multiply by ``head_dim ** -0.5``
+* ``Idefics3VisionEncoderLayer`` -- LayerNorm with weight *and* bias, and
+  ``gelu_pytorch_tanh``; the vision tower shares no normalisation or activation
+  with the text decoder, so ``layer_norm`` and ``gelu_tanh`` live beside
+  ``rms_norm`` and ``silu`` rather than replacing them.
 """
 
 from __future__ import annotations
@@ -28,13 +35,16 @@ def as_f32(array: np.ndarray) -> np.ndarray:
     return array if array.dtype == np.float32 else array.astype(np.float32, copy=False)
 
 
-def linear(x: np.ndarray, weight: np.ndarray) -> np.ndarray:
-    """``x @ W.T`` keeping HF's ``[out_features, in_features]`` weight layout.
+def linear(x: np.ndarray, weight: np.ndarray, bias: np.ndarray | None = None) -> np.ndarray:
+    """``x @ W.T (+ bias)``, keeping HF's ``[out_features, in_features]`` layout.
 
     The transpose is a view, so a converted checkpoint is never re-transposed on
-    disk nor copied at load time.
+    disk nor copied at load time. ``bias`` is ``None`` for every projection whose
+    ``nn.Linear`` was declared with ``bias=False``, which is decided per family in
+    :mod:`slowq.config` and not guessed here.
     """
-    return np.matmul(as_f32(x), as_f32(weight).T)
+    out = np.matmul(as_f32(x), as_f32(weight).T)
+    return out if bias is None else out + as_f32(bias)
 
 
 def rms_norm(x: np.ndarray, weight: np.ndarray, eps: float) -> np.ndarray:
@@ -43,6 +53,27 @@ def rms_norm(x: np.ndarray, weight: np.ndarray, eps: float) -> np.ndarray:
     variance = np.mean(x * x, axis=-1, keepdims=True)
     inv_rms = np.float32(1.0) / np.sqrt(variance + F32(eps))
     return as_f32(weight) * (x * inv_rms)
+
+
+def layer_norm(x: np.ndarray, weight: np.ndarray, bias: np.ndarray, eps: float) -> np.ndarray:
+    """``nn.LayerNorm`` over the last axis: affine, biased variance, FP32."""
+    x = as_f32(x)
+    mean = np.mean(x, axis=-1, keepdims=True)
+    variance = np.mean((x - mean) * (x - mean), axis=-1, keepdims=True)
+    normalised = (x - mean) / np.sqrt(variance + F32(eps))
+    return as_f32(weight) * normalised + as_f32(bias)
+
+
+def gelu_tanh(x: np.ndarray) -> np.ndarray:
+    """``gelu_pytorch_tanh``, the activation SmolVLM's vision MLP uses.
+
+    ``0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x**3)))`` — the tanh
+    approximation, not the erf-exact GELU. Using the wrong one is a small numeric
+    difference that compounds through 12 encoder layers.
+    """
+    x = as_f32(x)
+    inner = F32(0.7978845608028654) * (x + F32(0.044715) * x * x * x)
+    return F32(0.5) * x * (F32(1.0) + np.tanh(inner))
 
 
 def rope_inv_freq(head_dim: int, rope_theta: float) -> np.ndarray:
@@ -99,7 +130,7 @@ def sigmoid(x: np.ndarray) -> np.ndarray:
 
 
 def silu(x: np.ndarray) -> np.ndarray:
-    """SiLU/Swish, i.e. ``x * sigmoid(x)`` (HF's ``act_fn`` for Qwen3)."""
+    """SiLU/Swish, i.e. ``x * sigmoid(x)`` (HF's ``act_fn`` for the text MLP)."""
     x = as_f32(x)
     return x * sigmoid(x)
 
@@ -110,6 +141,17 @@ def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     shifted = x - np.max(x, axis=axis, keepdims=True)
     exponentiated = np.exp(shifted, dtype=np.float32)
     return exponentiated / np.sum(exponentiated, axis=axis, keepdims=True)
+
+
+def l2_normalize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    """Unit-normalise the last axis, the pooling step of Qwen3-Embedding.
+
+    HF's ``F.normalize`` divides by ``max(||x||, eps)``; the clamp only matters
+    for an all-zero vector, where it yields zeros instead of NaNs.
+    """
+    x = as_f32(x)
+    norm = np.sqrt(np.sum(x * x, axis=-1, keepdims=True))
+    return x / np.maximum(norm, F32(eps))
 
 
 def causal_attention_mask(
@@ -150,6 +192,9 @@ def group_query_attention(
     axis, so one batched matmul handles a whole GQA group. This is numerically
     identical to repeating K/V: query head ``kv * group + r`` attends to KV head
     ``kv`` in both formulations, in the same order HF's ``repeat_kv`` produces.
+    With ``num_kv_heads == num_heads`` the group size is 1, which is exactly the
+    multi-head attention the SmolVLM vision encoder needs, so it needs no second
+    implementation.
     """
     num_heads, num_queries, head_dim = q.shape
     if num_heads % num_kv_heads:
@@ -184,3 +229,63 @@ def split_heads(x: np.ndarray, num_heads: int, head_dim: int) -> np.ndarray:
 def merge_heads(x: np.ndarray, num_heads: int, num_queries: int, head_dim: int) -> np.ndarray:
     """``[num_heads, T, head_dim] -> [T, num_heads * head_dim]``."""
     return np.ascontiguousarray(x.transpose(1, 0, 2)).reshape(num_queries, num_heads * head_dim)
+
+
+def conv2d_patchify(
+    image: np.ndarray, weight: np.ndarray, bias: np.ndarray, patch_size: int
+) -> np.ndarray:
+    """``nn.Conv2d(k=s=patch_size, padding="valid")`` over one ``[C, H, W]`` image.
+
+    Returns ``[num_patches, out_channels]`` in row-major patch order, which is
+    what ``Idefics3VisionEmbeddings`` produces with its
+    ``permute(0, 2, 3, 1).reshape(B, -1, embed_dim)``.
+
+    A stride-equal-kernel convolution is a gather plus a matmul, so no convolution
+    is actually performed: the image is cut into non-overlapping ``[C, s, s]``
+    blocks, each flattened in PyTorch's ``[out, in, kh, kw]`` order (channel-major,
+    which is why the transpose below is ``(nh, nw, C, kh, kw)`` and not
+    ``(nh, nw, kh, kw, C)``), and the whole grid multiplied by the reshaped
+    kernel.
+    """
+    image = as_f32(image)
+    channels, height, width = image.shape
+    if height % patch_size or width % patch_size:
+        raise ValueError(
+            f"image is {height}x{width}, which is not a whole number of "
+            f"{patch_size}x{patch_size} patches"
+        )
+    rows, cols = height // patch_size, width // patch_size
+    out_channels = weight.shape[0]
+    blocks = image.reshape(channels, rows, patch_size, cols, patch_size)
+    blocks = blocks.transpose(1, 3, 0, 2, 4).reshape(rows * cols, channels * patch_size * patch_size)
+    kernel = as_f32(weight).reshape(out_channels, -1)
+    return np.matmul(blocks, kernel.T) + as_f32(bias)
+
+
+def pixel_shuffle(x: np.ndarray, scale_factor: int) -> np.ndarray:
+    """``Idefics3Connector.pixel_shuffle``, reshape for reshape.
+
+    ``[N, h*w, d] -> [N, (h/s)*(w/s), d*s*s]``. The two ``permute``/``reshape``
+    pairs are not a no-op: they decide which neighbouring patches end up
+    concatenated into one output feature, and therefore which image tokens the
+    connector's projections see. Reproducing the sequence exactly is cheaper than
+    reasoning about an equivalent one.
+    """
+    num_images, seq, embed_dim = x.shape
+    height = width = int(seq**0.5)
+    if height * width != seq:
+        raise ValueError(f"pixel_shuffle expects a square patch grid, got seq={seq}")
+    if height % scale_factor or width % scale_factor:
+        raise ValueError(
+            f"patch grid {height}x{width} is not divisible by scale_factor={scale_factor}"
+        )
+    x = x.reshape(num_images, height, width, embed_dim)
+    x = x.reshape(num_images, height, width // scale_factor, embed_dim * scale_factor)
+    x = x.transpose(0, 2, 1, 3)
+    x = x.reshape(
+        num_images, width // scale_factor, height // scale_factor, embed_dim * scale_factor**2
+    )
+    x = x.transpose(0, 2, 1, 3)
+    return np.ascontiguousarray(
+        x.reshape(num_images, seq // scale_factor**2, embed_dim * scale_factor**2)
+    )

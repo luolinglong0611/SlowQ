@@ -43,6 +43,39 @@ SHARD_2 = "model-00002-of-00002.safetensors"
 #: Big enough for the 24-tensor shard's header, and identical for both shards.
 PADDED_HEADER_BYTES = 8192
 
+#: A ``config_overrides`` value meaning "this key must be absent from the config
+#: that gets written". A merge cannot express a deletion, and the llama and
+#: qwen2 checkpoints really do lack ``head_dim`` — deriving it is part of what
+#: converting them has to get right.
+ABSENT = object()
+
+#: What SmolLM2's ``config.json`` adds and removes relative to the Qwen3-shaped
+#: template. Every value is a fact about ``LlamaConfig``, not a guess from the
+#: model's name: biases come from ``attention_bias``/``mlp_bias`` and there is no
+#: Q/K norm at any layer.
+LLAMA_TINY_CONFIG = {
+    "model_type": "llama",
+    "architectures": ["LlamaForCausalLM"],
+    "attention_bias": False,
+    "mlp_bias": False,
+    "head_dim": ABSENT,
+}
+
+
+def llama_tiny_tensors(vocab_size: int, seed: int = 21) -> dict[str, np.ndarray]:
+    """Llama-shaped weights: ``head_dim`` is derived, and no Q/K norm exists.
+
+    ``head_dim = hidden_size // num_attention_heads = 16 // 4 = 4``, so the
+    projections have to be built at that width rather than the Qwen3 template's
+    independent ``head_dim=8``.
+    """
+    tensors = tiny_tensors(vocab_size=vocab_size, head_dim=4, seed=seed)
+    return {
+        name: value
+        for name, value in tensors.items()
+        if not name.endswith(("q_norm.weight", "k_norm.weight"))
+    }
+
 
 def load_convert_tool():
     """Import ``tools/convert_model.py`` without making ``tools`` a package."""
@@ -139,6 +172,7 @@ def write_checkpoint(
     shards: Sequence[Mapping[str, np.ndarray]] | None = None,
     dtype: str = "BF16",
     header_bytes: Mapping[str, int] | None = None,
+    config_overrides: Mapping[str, object] | None = None,
 ) -> Path:
     """Write a checkpoint directory: config + tokenizer + one or more shards."""
     root = Path(root)
@@ -150,6 +184,18 @@ def write_checkpoint(
         "tokenizer_config.json",
     ):
         shutil.copyfile(template / name, root / name)
+    if config_overrides:
+        # The template is a Qwen3 config; a llama or qwen2 checkpoint differs in
+        # model_type, in which biases exist and in whether head_dim is written
+        # down at all, so those have to be replaceable.
+        path = root / "config.json"
+        merged = json.loads(path.read_text(encoding="utf-8"))
+        for key, value in config_overrides.items():
+            if value is ABSENT:
+                merged.pop(key, None)
+            else:
+                merged[key] = value
+        path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
 
     def encoded(name: str) -> tuple[str, np.ndarray]:
         array = tensors[name]
@@ -185,7 +231,7 @@ def write_checkpoint(
 
 @pytest.fixture
 def make_checkpoint(checkpoint_template: Path):
-    """Factory: ``make_checkpoint(root, seed=..., tensors=..., broken=...)``."""
+    """Factory: ``make_checkpoint(root, seed=..., tensors=..., broken=..., drop=...)``."""
 
     def factory(
         root: Path,
@@ -193,6 +239,7 @@ def make_checkpoint(checkpoint_template: Path):
         seed: int = 20261018,
         tensors: Mapping[str, np.ndarray] | None = None,
         broken: str | None = None,
+        drop: Sequence[str] = (),
         **kwargs,
     ) -> Path:
         vocab = int((checkpoint_template / "vocab_size.txt").read_text(encoding="utf-8"))
@@ -200,6 +247,10 @@ def make_checkpoint(checkpoint_template: Path):
         # The official Qwen3-0.6B checkpoint materialises the tied head anyway,
         # so the synthetic one does too: that is the path the alias logic covers.
         weights.setdefault(LM_HEAD, weights[EMBEDDING].copy())
+        for name in drop:
+            # SmolLM2 and Qwen2.5 never store the head, so a checkpoint without
+            # one has to be expressible too.
+            weights.pop(name, None)
         if broken == "shape":
             # Sorted last, so a single-shard conversion writes most of the model
             # before it hits this.
@@ -587,6 +638,92 @@ def test_a_tied_head_that_differs_in_the_same_shard_is_rejected(
     assert "tie_word_embeddings" in capsys.readouterr().err
 
 
+def test_a_tied_head_alone_in_its_own_shard_is_still_recorded_as_provenance(
+    tool, make_checkpoint, vocab_size: int, tmp_path: Path
+):
+    """Qwen3-1.7B's layout: ``lm_head.weight`` is the only tensor in shard 2.
+
+    The head is not part of the conversion plan, so the shard loop never opens
+    that file — but the tie comparison reads it, and a manifest that does not
+    claim it cannot prove which official bytes the converted model came from.
+    The reference side of ``tools/validate_reference.py`` hashes every
+    ``*.safetensors`` it loaded and refuses to compare against a manifest that
+    claims fewer files, which is how this was caught.
+    """
+    tensors = tiny_tensors(vocab_size=vocab_size, seed=12)
+    tensors[LM_HEAD] = tensors[EMBEDDING].copy()
+    first = {name: value for name, value in tensors.items() if name != LM_HEAD}
+    source = make_checkpoint(
+        tmp_path / "ckpt", tensors=tensors, shards=[first, {LM_HEAD: tensors[LM_HEAD]}]
+    )
+    out = tmp_path / "model"
+    assert tool.main(["--source", str(source), "--out", str(out)]) == 0
+
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    claimed = {entry["name"]: entry["sha256"] for entry in manifest["source"]["files"]}
+    assert set(claimed) == {SHARD_1, SHARD_2}
+    assert claimed[SHARD_2] == hashlib.sha256((source / SHARD_2).read_bytes()).hexdigest()
+    assert manifest["aliases"] == {LM_HEAD: EMBEDDING}
+
+
+def test_a_tied_checkpoint_that_stores_no_head_still_records_the_alias(
+    tool, make_checkpoint, vocab_size: int, tmp_path: Path
+):
+    """SmolLM2 and Qwen2.5 never store ``lm_head.weight``.
+
+    The tie is then declared by ``config.json`` alone, which is the same
+    evidence HF uses to build the shared module. Recording the alias anyway is
+    what keeps ``weights.get("lm_head.weight")`` answering on every generative
+    directory instead of only on the exports that happened to duplicate the
+    embedding matrix.
+    """
+    source = make_checkpoint(tmp_path / "ckpt", drop=[LM_HEAD])
+    out = tmp_path / "model"
+    assert tool.main(["--source", str(source), "--out", str(out)]) == 0
+
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["aliases"] == {LM_HEAD: EMBEDDING}
+    assert not (out / "tensors" / f"{LM_HEAD}.npy").exists()
+    weights = Weights.from_directory(out)
+    assert np.array_equal(np.asarray(weights.get(LM_HEAD)), np.asarray(weights.get(EMBEDDING)))
+    assert_still_usable(out)
+
+
+def test_a_llama_checkpoint_converts_without_any_qwen3_specific_tensor(
+    tool, make_checkpoint, vocab_size: int, tmp_path: Path
+):
+    """The SmolLM2 path end to end: derived ``head_dim``, no Q/K norm, tied head.
+
+    This is the checkpoint shape that the Qwen3-only rules used to reject twice
+    over — once for the missing ``head_dim`` and once for the missing
+    ``q_norm``/``k_norm`` — so both absences have to be legal here while the
+    Qwen3 refusals stay in force for a Qwen3 config.
+    """
+    source = make_checkpoint(
+        tmp_path / "ckpt",
+        tensors=llama_tiny_tensors(vocab_size),
+        drop=[LM_HEAD],
+        config_overrides=LLAMA_TINY_CONFIG,
+    )
+    out = tmp_path / "model"
+    assert tool.main(["--source", str(source), "--out", str(out)]) == 0
+
+    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["model_family"] == "llama"
+    assert manifest["task"] == "text-generation"
+    assert manifest["aliases"] == {LM_HEAD: EMBEDDING}
+
+    config = ModelConfig.from_json_file(out / "config.json")
+    assert config.family == "llama"
+    assert config.head_dim == 4, "LlamaConfig derives head_dim from hidden_size // heads"
+    assert not config.qk_norm and not config.qkv_bias and not config.mlp_bias
+
+    weights = Weights.from_directory(out)
+    assert not any("q_norm" in name or "k_norm" in name for name in weights.tensor_names)
+    weights.check_complete(config)
+    assert_still_usable(out)
+
+
 # --------------------------------------------------------------------------- #
 # 3. the download cache is keyed by repo + resolved commit
 # --------------------------------------------------------------------------- #
@@ -610,13 +747,23 @@ class FakeHub:
         return (self.revisions[revision] / name).read_bytes()
 
     def names(self, revision: str) -> list[str]:
-        return sorted(path.name for path in self.revisions[revision].iterdir())
+        """Every file of that revision, as relative paths.
+
+        Recursive on purpose: the real listing is fetched with
+        ``recursive=true``, and the file that decides an embedding task lives in
+        ``1_Pooling/config.json``.
+        """
+        root = self.revisions[revision]
+        return sorted(
+            str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()
+        )
 
     def http_get(self, url: str, timeout: float = 60.0) -> bytes:
         assert url.startswith(self.endpoint), url
         path = url[len(self.endpoint) :]
         if "/tree/" in path:
-            revision = path.split("/tree/", 1)[1]
+            assert "recursive=true" in path, url
+            revision = path.split("/tree/", 1)[1].split("?", 1)[0]
             return json.dumps(
                 [
                     {

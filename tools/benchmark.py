@@ -109,7 +109,7 @@ from slowq.metrics import (  # noqa: E402
     peak_rss_bytes,
     stopwatch,
 )
-from slowq.model import Qwen3Model  # noqa: E402
+from slowq.model import CausalLMModel  # noqa: E402
 from slowq.sampling import SamplingParams  # noqa: E402
 
 DEFAULT_ARTIFACTS = Path(__file__).resolve().parents[1] / "artifacts" / "benchmark"
@@ -206,7 +206,7 @@ class ForwardSpy:
     four chunks while calling ``forward`` exactly once.
     """
 
-    def __init__(self, model: Qwen3Model) -> None:
+    def __init__(self, model: CausalLMModel) -> None:
         self._model = model
         self._forward = model.forward
         self.token_counts: list[int] = []
@@ -227,7 +227,7 @@ class ForwardSpy:
 
 
 def time_prefill(
-    model: Qwen3Model, token_ids: Sequence[int], chunk_size: int | None, *, mode: str
+    model: CausalLMModel, token_ids: Sequence[int], chunk_size: int | None, *, mode: str
 ) -> dict[str, Any]:
     """Measure one prefill, on a cache that starts empty.
 

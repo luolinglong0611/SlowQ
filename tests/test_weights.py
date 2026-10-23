@@ -278,8 +278,8 @@ def test_expect_rejects_a_shape_that_disagrees_with_the_config(model_dir: Path):
 
 
 def test_a_broken_conversion_fails_before_the_first_forward(model_dir: Path):
-    """Qwen3Model validates completeness at construction, not 20 layers in."""
-    from slowq.model import Qwen3Model
+    """CausalLMModel validates completeness at construction, not 20 layers in."""
+    from slowq.model import CausalLMModel
 
     (model_dir / "tensors" / "model.layers.1.mlp.down_proj.weight.npy").unlink()
     manifest = read_manifest(model_dir)
@@ -289,4 +289,4 @@ def test_a_broken_conversion_fails_before_the_first_forward(model_dir: Path):
     write_manifest(model_dir, manifest)
     config = ModelConfig.from_json_file(model_dir / "config.json")
     with pytest.raises(WeightError):
-        Qwen3Model(config, Weights.from_directory(model_dir))
+        CausalLMModel(config, Weights.from_directory(model_dir))

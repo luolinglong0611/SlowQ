@@ -8,12 +8,21 @@ make that true.
 
 from __future__ import annotations
 
+import json
+import shutil
+from pathlib import Path
+
 import numpy as np
 import pytest
+from tokenizers import Tokenizer as HFTokenizer
 
+from slowq import Engine
 from slowq.cache import KVCache
-from slowq.errors import ContextOverflowError
-from slowq.model import DebugProbe, Qwen3Model
+from slowq.embedding import EmbeddingEngine
+from slowq.errors import ConfigError, ContextOverflowError
+from slowq.model import DebugProbe, CausalLMModel, load_config_and_weights
+
+from conftest import build_tiny_tokenizer, write_tiny_model
 
 #: FP32 matmul reassociation between a long prefill and several short ones.
 CHUNK_TOLERANCE = {"rtol": 2e-4, "atol": 2e-5}
@@ -21,10 +30,10 @@ CHUNK_TOLERANCE = {"rtol": 2e-4, "atol": 2e-5}
 
 @pytest.fixture
 def model(tiny_model_dir):
-    return Qwen3Model.from_directory(tiny_model_dir)
+    return CausalLMModel.from_directory(tiny_model_dir)
 
 
-def run_chunks(model: Qwen3Model, ids: list[int], chunk: int):
+def run_chunks(model: CausalLMModel, ids: list[int], chunk: int):
     """Prefill ``ids`` in chunks of ``chunk`` and return the final result."""
     cache = model.new_cache(max_context=max(64, len(ids) + 8))
     result = None
@@ -38,7 +47,7 @@ def run_chunks(model: Qwen3Model, ids: list[int], chunk: int):
 # --------------------------------------------------------------------------- #
 
 
-def test_forward_projects_only_the_last_position(model: Qwen3Model):
+def test_forward_projects_only_the_last_position(model: CausalLMModel):
     """No ``[T, vocab]`` logits tensor is ever materialised."""
     cache = model.new_cache(16)
     result = model.forward([1, 2, 3, 4, 5], cache)
@@ -48,7 +57,7 @@ def test_forward_projects_only_the_last_position(model: Qwen3Model):
     assert result.position_offset == 0
 
 
-def test_cache_length_advances_once_per_forward_not_once_per_layer(model: Qwen3Model):
+def test_cache_length_advances_once_per_forward_not_once_per_layer(model: CausalLMModel):
     cache = model.new_cache(16)
     model.forward([1, 2, 3], cache)
     # Every layer writes the same three slots; the length must not be multiplied.
@@ -56,13 +65,13 @@ def test_cache_length_advances_once_per_forward_not_once_per_layer(model: Qwen3M
     assert cache.high_water_mark == 3
 
 
-def test_forward_returns_the_cache_length_after_committing(model: Qwen3Model):
+def test_forward_returns_the_cache_length_after_committing(model: CausalLMModel):
     cache = model.new_cache(16)
     result = model.forward([7, 8], cache)
     assert result.cache_length == 2
 
 
-def test_second_forward_starts_at_the_cached_offset(model: Qwen3Model):
+def test_second_forward_starts_at_the_cached_offset(model: CausalLMModel):
     cache = model.new_cache(16)
     model.forward([1, 2, 3], cache)
     second = model.forward([4], cache)
@@ -70,35 +79,35 @@ def test_second_forward_starts_at_the_cached_offset(model: Qwen3Model):
     assert second.cache_length == 4
 
 
-def test_forward_is_deterministic(model: Qwen3Model):
+def test_forward_is_deterministic(model: CausalLMModel):
     first = model.forward([5, 6, 7], model.new_cache(16))
     second = model.forward([5, 6, 7], model.new_cache(16))
     np.testing.assert_array_equal(first.logits, second.logits)
 
 
-def test_logits_stay_finite_and_in_float32(model: Qwen3Model):
+def test_logits_stay_finite_and_in_float32(model: CausalLMModel):
     result = model.forward([1, 2, 3], model.new_cache(16))
     assert result.logits.dtype == np.float32
     assert np.all(np.isfinite(result.logits))
     assert np.all(np.isfinite(result.hidden_states))
 
 
-def test_embed_rejects_out_of_vocabulary_ids(model: Qwen3Model):
+def test_embed_rejects_out_of_vocabulary_ids(model: CausalLMModel):
     with pytest.raises(ValueError, match="outside the vocabulary"):
         model.embed([0, model.config.vocab_size])
 
 
-def test_embed_rejects_a_negative_id(model: Qwen3Model):
+def test_embed_rejects_a_negative_id(model: CausalLMModel):
     with pytest.raises(ValueError, match="outside the vocabulary"):
         model.embed([-1])
 
 
-def test_embed_rejects_an_empty_input(model: Qwen3Model):
+def test_embed_rejects_an_empty_input(model: CausalLMModel):
     with pytest.raises(ValueError, match="at least one token"):
         model.embed([])
 
 
-def test_forward_rejects_an_empty_input(model: Qwen3Model):
+def test_forward_rejects_an_empty_input(model: CausalLMModel):
     with pytest.raises(ValueError, match="at least one token"):
         model.forward([], model.new_cache(16))
 
@@ -108,13 +117,13 @@ def test_forward_rejects_an_empty_input(model: Qwen3Model):
 # --------------------------------------------------------------------------- #
 
 
-def test_output_projection_uses_the_tied_embedding_matrix(model: Qwen3Model):
+def test_output_projection_uses_the_tied_embedding_matrix(model: CausalLMModel):
     hidden = np.full(model.config.hidden_size, 0.25, dtype=np.float32)
     table = model.weights.get("model.embed_tokens.weight")
     np.testing.assert_allclose(model.output_projection(hidden), table @ hidden, rtol=1e-5)
 
 
-def test_logits_are_the_final_normed_hidden_times_the_embedding(model: Qwen3Model):
+def test_logits_are_the_final_normed_hidden_times_the_embedding(model: CausalLMModel):
     cache = model.new_cache(16)
     result = model.forward([3, 1, 4], cache)
     expected = model.output_projection(result.hidden_states[-1])
@@ -127,7 +136,7 @@ def test_logits_are_the_final_normed_hidden_times_the_embedding(model: Qwen3Mode
 
 
 @pytest.mark.parametrize("chunk", [1, 2, 3, 5, 7])
-def test_chunked_prefill_matches_a_single_prefill(model: Qwen3Model, chunk: int):
+def test_chunked_prefill_matches_a_single_prefill(model: CausalLMModel, chunk: int):
     ids = [11, 3, 7, 19, 2, 25, 8, 14, 1, 5, 30, 12]
     full, _ = run_chunks(model, ids, chunk=len(ids))
     chunked, cache = run_chunks(model, ids, chunk=chunk)
@@ -141,7 +150,7 @@ def test_chunked_prefill_matches_a_single_prefill(model: Qwen3Model, chunk: int)
 
 
 @pytest.mark.parametrize("chunk", [1, 2, 4])
-def test_chunk_boundaries_do_not_shift_positions(model: Qwen3Model, chunk: int):
+def test_chunk_boundaries_do_not_shift_positions(model: CausalLMModel, chunk: int):
     """Chunking must not restart RoPE positions at every chunk boundary."""
     ids = list(range(1, 10))
     reference, reference_cache = run_chunks(model, ids, chunk=len(ids))
@@ -154,7 +163,7 @@ def test_chunk_boundaries_do_not_shift_positions(model: Qwen3Model, chunk: int):
     assert reference.logits.shape == (model.config.vocab_size,)
 
 
-def test_cached_token_by_token_decode_matches_one_long_prefill(model: Qwen3Model):
+def test_cached_token_by_token_decode_matches_one_long_prefill(model: CausalLMModel):
     """The property that makes incremental generation correct at all."""
     ids = [9, 4, 21, 2, 17, 6]
 
@@ -172,7 +181,7 @@ def test_cached_token_by_token_decode_matches_one_long_prefill(model: Qwen3Model
     )
 
 
-def test_prefill_then_decode_matches_a_longer_prefill(model: Qwen3Model):
+def test_prefill_then_decode_matches_a_longer_prefill(model: CausalLMModel):
     """Extend a sequence by one token two ways and compare the new logits."""
     prefix = [5, 12, 3, 27]
     extra = 8
@@ -188,7 +197,7 @@ def test_prefill_then_decode_matches_a_longer_prefill(model: Qwen3Model):
     assert split_cache.length == long_cache.length == len(prefix) + 1
 
 
-def test_a_cache_reset_makes_the_next_forward_reproducible(model: Qwen3Model):
+def test_a_cache_reset_makes_the_next_forward_reproducible(model: CausalLMModel):
     cache = model.new_cache(32)
     first = model.forward([1, 2, 3], cache).logits
     cache.reset()
@@ -196,7 +205,7 @@ def test_a_cache_reset_makes_the_next_forward_reproducible(model: Qwen3Model):
     np.testing.assert_array_equal(first, second)
 
 
-def test_two_caches_for_the_same_input_agree(model: Qwen3Model):
+def test_two_caches_for_the_same_input_agree(model: CausalLMModel):
     ids = [2, 4, 6, 8, 10]
     a = model.forward(ids, model.new_cache(32)).logits
     b = model.forward(ids, model.new_cache(32)).logits
@@ -208,27 +217,27 @@ def test_two_caches_for_the_same_input_agree(model: Qwen3Model):
 # --------------------------------------------------------------------------- #
 
 
-def test_a_position_offset_disagreeing_with_the_cache_is_rejected(model: Qwen3Model):
+def test_a_position_offset_disagreeing_with_the_cache_is_rejected(model: CausalLMModel):
     cache = model.new_cache(32)
     model.forward([1, 2], cache)
     with pytest.raises(ValueError, match="disagrees with kv_cache.length"):
         model.forward([3], cache, position_offset=0)
 
 
-def test_an_explicit_matching_offset_is_accepted(model: Qwen3Model):
+def test_an_explicit_matching_offset_is_accepted(model: CausalLMModel):
     cache = model.new_cache(32)
     model.forward([1, 2], cache)
     assert model.forward([3], cache, position_offset=2).cache_length == 3
 
 
-def test_exceeding_max_context_raises_instead_of_truncating(model: Qwen3Model):
+def test_exceeding_max_context_raises_instead_of_truncating(model: CausalLMModel):
     cache = model.new_cache(8)
     model.forward([1, 2, 3, 4, 5], cache)
     with pytest.raises(ContextOverflowError, match="max_context"):
         model.forward([6, 7, 8, 9], cache)
 
 
-def test_an_overflowing_forward_leaves_the_cache_length_untouched(model: Qwen3Model):
+def test_an_overflowing_forward_leaves_the_cache_length_untouched(model: CausalLMModel):
     cache = model.new_cache(8)
     model.forward([1, 2, 3], cache)
     with pytest.raises(ContextOverflowError):
@@ -236,7 +245,7 @@ def test_an_overflowing_forward_leaves_the_cache_length_untouched(model: Qwen3Mo
     assert cache.length == 3
 
 
-def test_exceeding_max_position_embeddings_raises(model: Qwen3Model):
+def test_exceeding_max_position_embeddings_raises(model: CausalLMModel):
     """Guards a caller who builds a KVCache larger than the model's position grid.
 
     ``new_cache`` already refuses such a capacity, so this constructs the cache
@@ -254,12 +263,12 @@ def test_exceeding_max_position_embeddings_raises(model: Qwen3Model):
         model.forward([1, 2], cache)
 
 
-def test_new_cache_validates_max_context(model: Qwen3Model):
+def test_new_cache_validates_max_context(model: CausalLMModel):
     with pytest.raises(Exception, match="max_position_embeddings"):
         model.new_cache(model.config.max_position_embeddings + 1)
 
 
-def test_new_cache_is_sized_from_the_config(model: Qwen3Model):
+def test_new_cache_is_sized_from_the_config(model: CausalLMModel):
     cache = model.new_cache(12)
     assert len(cache.keys) == model.config.num_hidden_layers
     assert cache.keys[0].shape == (
@@ -274,14 +283,14 @@ def test_new_cache_is_sized_from_the_config(model: Qwen3Model):
 # --------------------------------------------------------------------------- #
 
 
-def test_probing_does_not_change_the_numerics(model: Qwen3Model):
+def test_probing_does_not_change_the_numerics(model: CausalLMModel):
     plain = model.forward([1, 2, 3], model.new_cache(16)).logits
     probe = DebugProbe.for_names(DebugProbe.ALL_CAPTURES)
     probed = model.forward([1, 2, 3], model.new_cache(16), probe=probe).logits
     np.testing.assert_array_equal(plain, probed)
 
 
-def test_probe_captures_the_requested_layers_only(model: Qwen3Model):
+def test_probe_captures_the_requested_layers_only(model: CausalLMModel):
     probe = DebugProbe.for_names(
         {"layer_output"}, layer_indices={1}, positions=(0, -1)
     )
@@ -290,7 +299,7 @@ def test_probe_captures_the_requested_layers_only(model: Qwen3Model):
     assert probe.records["layer1.layer_output[-1]"].shape == (model.config.hidden_size,)
 
 
-def test_probe_captures_every_requested_point(model: Qwen3Model):
+def test_probe_captures_every_requested_point(model: CausalLMModel):
     probe = DebugProbe.for_names(
         DebugProbe.ALL_CAPTURES, layer_indices={0}, positions=(-1,)
     )
@@ -305,14 +314,14 @@ def test_probe_captures_every_requested_point(model: Qwen3Model):
     assert probe.records["logits[-1]"].shape == (model.config.vocab_size,)
 
 
-def test_probe_with_no_layer_filter_captures_every_layer(model: Qwen3Model):
+def test_probe_with_no_layer_filter_captures_every_layer(model: CausalLMModel):
     probe = DebugProbe.for_names({"layer_output"})
     model.forward([1, 2], model.new_cache(16), probe=probe)
     captured = {int(k.split(".")[0].removeprefix("layer")) for k in probe.records}
     assert captured == set(range(model.config.num_hidden_layers))
 
 
-def test_probe_records_are_detached_copies(model: Qwen3Model):
+def test_probe_records_are_detached_copies(model: CausalLMModel):
     probe = DebugProbe.for_names({"final_norm"})
     model.forward([1, 2, 3], model.new_cache(16), probe=probe)
     recorded = probe.records["final_norm[-1]"]
@@ -326,7 +335,7 @@ def test_probe_rejects_an_unknown_capture_point():
         DebugProbe.for_names({"attention_scores"})
 
 
-def test_a_layer_output_is_the_embedding_plus_both_residual_branches(model: Qwen3Model):
+def test_a_layer_output_is_the_embedding_plus_both_residual_branches(model: CausalLMModel):
     """``out = x + Attention(norm(x))`` then ``out = out + MLP(norm(out))``."""
     probe = DebugProbe.for_names(
         {"embed", "attention_output", "mlp_output", "layer_output"}, layer_indices={0}
@@ -341,7 +350,7 @@ def test_a_layer_output_is_the_embedding_plus_both_residual_branches(model: Qwen
     )
 
 
-def test_the_second_layer_starts_where_the_first_one_ended(model: Qwen3Model):
+def test_the_second_layer_starts_where_the_first_one_ended(model: CausalLMModel):
     probe = DebugProbe.for_names({"layer_output"}, layer_indices={0, 1})
     model.forward([1, 2, 3], model.new_cache(16), probe=probe)
     # Layer 1's own residual chain must build on layer 0's output, so the two
@@ -357,7 +366,7 @@ def test_the_second_layer_starts_where_the_first_one_ended(model: Qwen3Model):
 # --------------------------------------------------------------------------- #
 
 
-def assert_logits_match_their_own_hidden_state(model: Qwen3Model, probe: DebugProbe) -> None:
+def assert_logits_match_their_own_hidden_state(model: CausalLMModel, probe: DebugProbe) -> None:
     """Every captured logit row must be the projection of the matching hidden state."""
     for position in probe.positions:
         np.testing.assert_allclose(
@@ -369,7 +378,7 @@ def assert_logits_match_their_own_hidden_state(model: Qwen3Model, probe: DebugPr
         )
 
 
-def test_probe_logits_at_every_requested_position_belong_to_that_position(model: Qwen3Model):
+def test_probe_logits_at_every_requested_position_belong_to_that_position(model: CausalLMModel):
     probe = DebugProbe.for_names({"final_norm", "logits"}, positions=(0, 1, 2, -1))
     forward = model.forward([5, 6, 7, 8], model.new_cache(16), probe=probe)
 
@@ -387,7 +396,7 @@ def test_probe_logits_at_every_requested_position_belong_to_that_position(model:
 
 
 def test_probe_logits_positions_count_from_the_start_of_this_forward_block(
-    model: Qwen3Model,
+    model: CausalLMModel,
 ):
     """Position 0 of a decode block is that block's first token, not the prompt's."""
     cache = model.new_cache(16)
@@ -404,7 +413,7 @@ def test_probe_logits_positions_count_from_the_start_of_this_forward_block(
     ), "position 0 was resolved against the whole context instead of this block"
 
 
-def test_a_single_token_forward_reports_its_only_position(model: Qwen3Model):
+def test_a_single_token_forward_reports_its_only_position(model: CausalLMModel):
     cache = model.new_cache(16)
     model.forward([5, 6, 7], cache)
     probe = DebugProbe.for_names({"final_norm", "logits"}, positions=(0,))
@@ -412,7 +421,7 @@ def test_a_single_token_forward_reports_its_only_position(model: Qwen3Model):
     np.testing.assert_array_equal(probe.records["logits[0]"], forward.logits)
 
 
-def test_probing_a_position_the_block_does_not_have_is_an_error(model: Qwen3Model):
+def test_probing_a_position_the_block_does_not_have_is_an_error(model: CausalLMModel):
     for positions in ((4,), (1, 4), (-5,)):
         probe = DebugProbe.for_names({"logits"}, positions=positions)
         with pytest.raises(ValueError, match="outside this forward"):
@@ -423,7 +432,7 @@ def test_probing_a_position_the_block_does_not_have_is_an_error(model: Qwen3Mode
         model.forward([1, 2], model.new_cache(16), probe=probe)
 
 
-def test_positions_nobody_asked_for_are_never_projected(model: Qwen3Model, monkeypatch):
+def test_positions_nobody_asked_for_are_never_projected(model: CausalLMModel, monkeypatch):
     """A full-vocab projection is the most expensive thing in the model."""
     calls: list[int] = []
     original = model.output_projection
@@ -452,3 +461,80 @@ def test_positions_nobody_asked_for_are_never_projected(model: Qwen3Model, monke
     probe = DebugProbe.for_names({"logits"}, positions=(0, 1, -1))
     model.forward([1, 2, 3, 4], model.new_cache(16), probe=probe)
     assert calls == [1, 1, 1], "one projection per requested position, no more"
+
+
+# --------------------------------------------------------------------------- #
+# the directory has to agree with itself
+#
+# ``config.json`` says which rules decode the weights; a version-2 manifest also
+# records the family the converter saw. Those are two independent claims about
+# the same directory, so a hand-edited manifest or a swapped config used to load
+# happily and then compute with the wrong family's rules -- no crash, just
+# different numbers.
+# --------------------------------------------------------------------------- #
+
+
+def _tiny_dir(tmp_path: Path, name: str, *, task: str | None) -> Path:
+    root = tmp_path / name
+    root.mkdir()
+    build_tiny_tokenizer(root)
+    vocab_size = HFTokenizer.from_file(str(root / "tokenizer.json")).get_vocab_size()
+    return write_tiny_model(root, vocab_size=vocab_size, task=task)
+
+
+def _claiming_family(source: Path, tmp_path: Path, family: str) -> Path:
+    """A copy whose manifest claims ``family``; config.json and tensors untouched."""
+    root = tmp_path / f"{source.name}-claims-{family}"
+    shutil.copytree(source, root)
+    path = root / "manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["model_family"] = family
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return root
+
+
+def test_a_manifest_that_disagrees_with_config_json_is_refused(tmp_path: Path):
+    directory = _tiny_dir(tmp_path, "v2-generation", task="text-generation")
+    config, _ = load_config_and_weights(directory)
+    assert config.family == "qwen3"
+
+    liar = _claiming_family(directory, tmp_path, "llama")
+    with pytest.raises(ConfigError, match=r"model_family='llama'.*model_type='qwen3'"):
+        load_config_and_weights(liar)
+    # The public entry point refuses it too, before any weight is read.
+    with pytest.raises(ConfigError, match="inconsistent"):
+        Engine.from_directory(liar, max_context=64)
+
+
+def test_the_embedding_entry_refuses_the_same_inconsistent_directory(tmp_path: Path):
+    directory = _tiny_dir(tmp_path, "v2-embedding", task="text-embedding")
+    assert EmbeddingEngine.from_directory(directory, max_length=64).dimension > 0
+
+    liar = _claiming_family(directory, tmp_path, "qwen2")
+    with pytest.raises(ConfigError, match=r"model_family='qwen2'.*model_type='qwen3'"):
+        EmbeddingEngine.from_directory(liar, max_length=64)
+
+
+def test_a_consistent_v2_directory_still_loads(tmp_path: Path):
+    """The control: the check must not fire on what the converter really writes."""
+    for task in ("text-generation", "text-embedding"):
+        directory = _tiny_dir(tmp_path, f"v2-ok-{task}", task=task)
+        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+        assert manifest["format_version"] == 2
+        config, _ = load_config_and_weights(directory)
+        assert config.family == manifest["model_family"] == "qwen3"
+
+
+def test_a_v1_manifest_is_not_asked_for_a_field_it_never_had(tmp_path: Path):
+    """v0.1 directories stay loadable: no ``model_family`` key, no new requirement."""
+    directory = _tiny_dir(tmp_path, "v1-legacy", task=None)
+    manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["format_version"] == 1
+    assert "model_family" not in manifest
+
+    config, weights = load_config_and_weights(directory)
+    assert weights.manifest.model_family is None
+    assert config.family == "qwen3"
+    assert Engine.from_directory(directory, max_context=64).generate(
+        prompt="hi", max_new_tokens=1
+    ).token_ids

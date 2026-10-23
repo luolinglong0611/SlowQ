@@ -56,7 +56,7 @@ def test_normalize_rejects_an_empty_conversation():
 
 @pytest.mark.parametrize("role", ["tool", "function", "developer", "USER", ""])
 def test_normalize_rejects_unsupported_roles(role: str):
-    with pytest.raises(UnsupportedInputError, match="not supported in v0.1"):
+    with pytest.raises(UnsupportedInputError, match="is not supported"):
         normalize_messages([{"role": role, "content": "x"}])
 
 
@@ -83,7 +83,7 @@ def test_normalize_rejects_function_call():
     ],
 )
 def test_normalize_rejects_non_string_content(content):
-    """v0.1 is text-only: multi-part and multimodal content must be refused."""
+    """The text path is text-only: multi-part content must be refused, not flattened."""
     with pytest.raises(UnsupportedInputError, match="text-only|plain string"):
         normalize_messages([{"role": "user", "content": content}])
 

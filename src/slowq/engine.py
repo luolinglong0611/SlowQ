@@ -16,18 +16,24 @@ as decoding.
 
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+import numpy as np
+
 from .cache import KVCache
-from .config import GenerationConfig, ModelConfig
-from .errors import ContextOverflowError, UnsupportedInputError
+from .config import (
+    TASK_TEXT_EMBEDDING,
+    TASK_TEXT_GENERATION,
+    GenerationConfig,
+    ModelConfig,
+)
+from .errors import ConfigError, ContextOverflowError, UnsupportedInputError
 from .metrics import GenerationMetrics, peak_rss_bytes, stopwatch
-from .model import DebugProbe, Qwen3Model
+from .model import CausalLMModel, DebugProbe, load_config_and_weights
 from .sampling import Sampler, SamplingParams
 from .tokenizer import ChatMessage, Tokenizer, stop_token_ids
 from .weights import Weights
@@ -40,6 +46,26 @@ DEFAULT_MAX_NEW_TOKENS = 128
 class StopReason(str, Enum):
     EOS = "eos"
     MAX_NEW_TOKENS = "max_new_tokens"
+
+
+def recorded_task(model_dir: str | Path) -> str:
+    """What a converted directory says it is for.
+
+    Read from the manifest, not from ``config.json``: the config cannot answer
+    it. ``Qwen/Qwen3-Embedding-0.6B`` publishes ``model_type: "qwen3"`` and
+    ``architectures: ["Qwen3ForCausalLM"]``, the same task-relevant fields as the
+    chat model, so a loader that guessed from them would build a generator out of
+    an embedding checkpoint.
+    """
+    root = Path(model_dir)
+    if not (root / "config.json").is_file():
+        raise UnsupportedInputError(
+            f"{root / 'config.json'} not found; run tools/convert_model.py first"
+        )
+    task = Weights.from_directory(root).manifest.task
+    # A format_version 1 manifest carries no task key. Only SlowQ v0.1 wrote
+    # those, and v0.1 converted nothing but Qwen3 causal LMs.
+    return TASK_TEXT_GENERATION if task is None else task
 
 
 @dataclass(frozen=True)
@@ -86,7 +112,7 @@ class Engine:
 
     def __init__(
         self,
-        model: Qwen3Model,
+        model: CausalLMModel,
         tokenizer: Tokenizer,
         generation_config: GenerationConfig,
         max_context: int = DEFAULT_MAX_CONTEXT,
@@ -119,21 +145,33 @@ class Engine:
         max_context: int = DEFAULT_MAX_CONTEXT,
         prefill_chunk_size: int = DEFAULT_PREFILL_CHUNK_SIZE,
     ) -> "Engine":
-        """Load a converted model. Fully offline: no network access happens here."""
+        """Load a converted model. Fully offline: no network access happens here.
+
+        The directory's recorded task decides whether this is the right engine to
+        build. Refusing here, with the task named, is better than constructing a
+        causal LM out of an embedding checkpoint and failing on a missing
+        ``lm_head`` halfway through the first forward.
+        """
         with stopwatch() as elapsed:
             root = Path(model_dir)
-            config_path = root / "config.json"
-            if not config_path.is_file():
-                raise UnsupportedInputError(
-                    f"{config_path} not found; run tools/convert_model.py first"
+            task = recorded_task(root)
+            if task == TASK_TEXT_EMBEDDING:
+                raise ConfigError(
+                    f"{root} is a converted text-embedding model (task={task!r}); it "
+                    "has no output projection and cannot generate. Load it with "
+                    "slowq.embedding.EmbeddingEngine, or from the CLI with "
+                    "``slowq embed``."
                 )
-            config = ModelConfig.from_hf_config(
-                json.loads(config_path.read_text(encoding="utf-8"))
-            )
+            if task != TASK_TEXT_GENERATION:
+                raise ConfigError(
+                    f"{root} is a converted {task!r} model; load it with "
+                    "slowq.vlm.VisionEngine (CLI: ``slowq vlm``)."
+                )
+            config, weights = load_config_and_weights(root, task)
             generation_config = GenerationConfig.from_json_file(
-                root / "generation_config.json", config_path
+                root / "generation_config.json", root / "config.json"
             )
-            model = Qwen3Model(config, Weights.from_directory(root))
+            model = CausalLMModel(config, weights)
             tokenizer = Tokenizer.from_directory(root)
         return cls(
             model=model,
@@ -222,16 +260,19 @@ class Engine:
             tokenize_seconds=tokenize_seconds,
         )
 
-    def stream_ids(
-        self,
-        prompt_ids: Sequence[int],
-        *,
-        sampling: SamplingParams | None = None,
-        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
-        tokenize_seconds: float = 0.0,
-        probe: DebugProbe | None = None,
-    ) -> Iterator[GenerationStep]:
-        """The one real generation loop: chunked prefill, then token by token."""
+    def _validate_request(
+        self, prompt_ids: Sequence[int], max_new_tokens: int
+    ) -> list[int]:
+        """Check what a request asks for before doing any of its work.
+
+        Shared with ``slowq.vlm.VisionEngine.stream_prompt``, which has to run it
+        *before* encoding the image: the vision tower is the most expensive part
+        of that request, and a caller that asks for zero new tokens or for more
+        than ``max_context`` should be refused without paying for it. Keeping the
+        two paths on one implementation is what stops them drifting apart.
+
+        Returns the prompt as a plain ``list[int]``, since every caller wants it.
+        """
         ids = [int(token_id) for token_id in prompt_ids]
         if not ids:
             raise UnsupportedInputError(
@@ -249,10 +290,35 @@ class Engine:
                 f"{required} exceeds max_context={self.max_context}. Raise "
                 "--max-context or lower --max-new-tokens; SlowQ never truncates."
             )
+        return ids
+
+    def stream_ids(
+        self,
+        prompt_ids: Sequence[int],
+        *,
+        sampling: SamplingParams | None = None,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        tokenize_seconds: float = 0.0,
+        vision_encode_seconds: float = 0.0,
+        probe: DebugProbe | None = None,
+        prefill_embeds: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> Iterator[GenerationStep]:
+        """The one real generation loop: chunked prefill, then token by token.
+
+        ``prefill_embeds`` is ``(features, mask)``: rows that replace the embedded
+        prompt tokens the boolean mask selects. Only ``slowq.vlm`` produces them —
+        a text prompt embeds entirely from the table — and they are an argument
+        rather than engine state so that a request cannot leak image features into
+        the next one. ``vision_encode_seconds`` travels the same way: it belongs to
+        time-to-first-token, and without it the vision path would report a TTFT
+        that silently omits its largest cost.
+        """
+        ids = self._validate_request(prompt_ids, max_new_tokens)
 
         sampler = Sampler(sampling or SamplingParams())
         metrics = GenerationMetrics(
             tokenize_seconds=tokenize_seconds,
+            vision_encode_seconds=vision_encode_seconds,
             prompt_tokens=len(ids),
             weight_logical_bytes=self.model.weights.deduplicated_bytes(),
             kv_allocated_bytes=self._cache.allocated_bytes(),
@@ -264,12 +330,39 @@ class Engine:
         request_start = time.perf_counter()
 
         forward = None
+        embeds, embed_mask = (None, None) if prefill_embeds is None else prefill_embeds
+        if embed_mask is not None:
+            embed_mask = np.asarray(embed_mask, dtype=bool).reshape(-1)
+            if embed_mask.shape[0] != len(ids):
+                raise ValueError(
+                    f"prefill_embeds covers {embed_mask.shape[0]} prompt positions "
+                    f"but the prompt has {len(ids)} tokens"
+                )
+            if embeds is None and embed_mask.any():
+                raise ValueError(
+                    "prefill_embeds marks placeholder positions but supplies no "
+                    "feature rows to put there"
+                )
         with stopwatch() as prefill_elapsed:
+            feature_cursor = 0
             for start in range(0, len(ids), self.prefill_chunk_size):
+                chunk = ids[start : start + self.prefill_chunk_size]
+                chunk_embeds = chunk_mask = None
+                if embed_mask is not None:
+                    # Placeholder tokens can straddle a chunk boundary, so each
+                    # chunk takes its own slice of the feature rows in prompt
+                    # order rather than assuming the image fits in one chunk.
+                    chunk_mask = embed_mask[start : start + len(chunk)]
+                    take = int(chunk_mask.sum())
+                    if take:
+                        chunk_embeds = embeds[feature_cursor : feature_cursor + take]
+                    feature_cursor += take
                 forward = self.model.forward(
-                    ids[start : start + self.prefill_chunk_size],
+                    chunk,
                     self._cache,
                     probe=probe,
+                    inputs_embeds=chunk_embeds,
+                    inputs_embed_mask=chunk_mask,
                 )
                 metrics.prefill_chunks += 1
         metrics.prefill_seconds = prefill_elapsed[0]
@@ -285,7 +378,10 @@ class Engine:
                 with stopwatch() as sample_elapsed:
                     token_id = sampler.sample(logits)
                 metrics.first_token_seconds = (
-                    tokenize_seconds + metrics.prefill_seconds + sample_elapsed[0]
+                    tokenize_seconds
+                    + vision_encode_seconds
+                    + metrics.prefill_seconds
+                    + sample_elapsed[0]
                 )
                 first_token = False
             else:
@@ -308,7 +404,10 @@ class Engine:
                 text_parts.append(flushed)
                 metrics.generated_tokens = len(generated)
                 metrics.total_seconds = (
-                    tokenize_seconds + time.perf_counter() - request_start
+                    tokenize_seconds
+                    + vision_encode_seconds
+                    + time.perf_counter()
+                    - request_start
                 )
                 metrics.stop_reason = (
                     StopReason.EOS.value if is_stop_token else StopReason.MAX_NEW_TOKENS.value
