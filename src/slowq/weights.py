@@ -319,6 +319,38 @@ class Weights:
                 total += path.stat().st_size
         return total
 
+    def fingerprint(self) -> tuple[Any, ...]:
+        """A hashable identity for *these weights*, for keying derived-value caches.
+
+        Everything a cached activation or embedding depends on that the array
+        contents cannot show: which directory, which converter format and source
+        revision, which compute dtype, and the exact tensor table. Re-converting
+        the same checkpoint at a different precision changes ``compute_dtype`` and
+        so invalidates; pointing at a different directory changes the path.
+
+        It reads the manifest and never the tensors. Hashing 500 MiB of FP32 to
+        key a cache that exists to skip one forward would cost more than the
+        forward it saves. The consequence is deliberate and narrow: a process that
+        overwrites the ``.npy`` files under an already-loaded engine keeps the old
+        fingerprint — but it also keeps the old mmap, so the cached value still
+        matches what that engine would compute.
+        """
+        manifest = self.manifest
+        return (
+            str(self.root.resolve()),
+            manifest.format_version,
+            manifest.model_family,
+            manifest.task,
+            manifest.compute_dtype,
+            manifest.source_revision,
+            tuple(
+                sorted(
+                    (name, tuple(spec.shape), spec.dtype)
+                    for name, spec in manifest.tensors.items()
+                )
+            ),
+        )
+
     def iter_specs(self) -> Iterator[TensorSpec]:
         yield from (self.manifest.tensors[name] for name in self.tensor_names)
 

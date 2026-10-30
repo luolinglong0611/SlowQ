@@ -199,31 +199,58 @@ def probe_token_ids(length: int, vocab_size: int) -> list[int]:
 
 
 class ForwardSpy:
-    """Count the ``model.forward`` calls a timing block really executed.
+    """Count the decoder-stack calls a timing block really executed.
 
     The chunk count in the report has to be *observed*. Deriving it from
     ``length // chunk_size`` is what let an earlier version of this sweep claim
     four chunks while calling ``forward`` exactly once.
+
+    Both entry points are counted, because ``DecoderModel.prefill`` runs every
+    non-final chunk through ``encode`` and only the last through ``forward``. A
+    spy on ``forward`` alone would report one call for a four-chunk prefill —
+    the same class of wrong report this exists to prevent, arrived at from the
+    other direction. ``forward`` calls ``encode`` internally, so a depth guard
+    stops one chunk being counted twice.
     """
 
     def __init__(self, model: CausalLMModel) -> None:
         self._model = model
         self._forward = model.forward
+        self._encode = model.encode
         self.token_counts: list[int] = []
+        self.entry_points: list[str] = []
+        self._depth = 0
 
     def __enter__(self) -> "ForwardSpy":
         spy = self
 
-        def forward(input_ids, kv_cache, *args, **kwargs):
-            spy.token_counts.append(len(input_ids))
-            return spy._forward(input_ids, kv_cache, *args, **kwargs)
+        def wrap(name: str, original: Any) -> Any:
+            def wrapper(input_ids, kv_cache, *args, **kwargs):
+                outer = spy._depth == 0
+                spy._depth += 1
+                try:
+                    if outer:
+                        spy.token_counts.append(len(input_ids))
+                        spy.entry_points.append(name)
+                    return original(input_ids, kv_cache, *args, **kwargs)
+                finally:
+                    spy._depth -= 1
 
-        self._model.forward = forward
+            return wrapper
+
+        self._model.forward = wrap("forward", self._forward)
+        self._model.encode = wrap("encode", self._encode)
         return self
 
     def __exit__(self, *exc_info) -> bool:
         self._model.forward = self._forward
+        self._model.encode = self._encode
         return False
+
+    @property
+    def projections(self) -> int:
+        """Chunks that ran the vocabulary projection, i.e. called ``forward``."""
+        return self.entry_points.count("forward")
 
 
 def time_prefill(
@@ -232,22 +259,19 @@ def time_prefill(
     """Measure one prefill, on a cache that starts empty.
 
     ``chunk_size=None`` feeds the whole block in a single forward; otherwise the
-    block goes through the chunk loop the engine runs, appending to one growing
-    cache. Only the forwards are inside the stopwatch: argmax, sampling and
-    printing are not prefill and must not be billed to it.
+    block goes through ``DecoderModel.prefill``, the same chunk loop the engine
+    runs, appending to one growing cache. Measuring a hand-written loop here
+    instead would let the engine and the benchmark drift apart — the report would
+    describe a prefill no request ever performs. Only the decoder-stack calls are
+    inside the stopwatch: argmax, sampling and printing are not prefill and must
+    not be billed to it.
     """
-    blocks = (
-        [list(token_ids)]
-        if chunk_size is None
-        else [
-            list(token_ids)[start : start + chunk_size]
-            for start in range(0, len(token_ids), chunk_size)
-        ]
-    )
     cache = model.new_cache(len(token_ids) + 1)
     with ForwardSpy(model) as spy, stopwatch() as elapsed:
-        for block in blocks:
-            model.forward(block, cache)
+        if chunk_size is None:
+            model.forward(list(token_ids), cache)
+        else:
+            model.prefill(list(token_ids), cache, chunk_size=chunk_size)
     seconds = elapsed[0]
     return {
         "mode": mode,
@@ -255,6 +279,8 @@ def time_prefill(
         "chunk_size": None if chunk_size is None else int(chunk_size),
         "forwards": len(spy.token_counts),
         "forward_token_counts": list(spy.token_counts),
+        "entry_points": list(spy.entry_points),
+        "vocabulary_projections": spy.projections,
         "prefill_seconds": seconds,
         "prefill_tokens_per_second": len(token_ids) / seconds if seconds > 0 else float("nan"),
         "cache_length": cache.length,
@@ -268,6 +294,11 @@ def measure_prefill_sweep(engine: Engine, max_length: int) -> list[dict[str, Any
     versus ``ceil(T / chunk)`` matmuls against a growing KV cache. Reporting the
     first under the second's label is how a report ends up describing a run that
     never happened.
+
+    Both rows now run exactly one vocabulary projection, so the difference
+    between them is the chunking itself and nothing else. That was not true when
+    the chunked row projected every chunk: it made chunked prefill look worse
+    than it is by an amount that grew with the prompt length.
     """
     model = engine.model
     rows: list[dict[str, Any]] = []
@@ -283,7 +314,8 @@ def measure_prefill_sweep(engine: Engine, max_length: int) -> list[dict[str, Any
                 f"  prefill {length:>4} tokens  {label:<13} "
                 f"{row['prefill_seconds'] * 1e3:>9.1f} ms  "
                 f"{row['prefill_tokens_per_second']:>8.1f} tok/s  "
-                f"({row['forwards']} forward(s): {row['forward_token_counts']})",
+                f"({row['forwards']} decoder call(s): {row['forward_token_counts']}, "
+                f"{row['vocabulary_projections']} vocab projection(s))",
                 file=sys.stderr,
             )
     return rows

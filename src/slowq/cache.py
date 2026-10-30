@@ -90,6 +90,28 @@ class KVCache:
         self.length = 0
         self.high_water_mark = 0
 
+    def truncate(self, new_length: int) -> None:
+        """Forget the tokens past ``new_length``, keeping the earlier ones.
+
+        The mirror of :meth:`reset` for a caller that wants to reuse a *prefix*.
+        Like ``reset`` this is pure bookkeeping: no array is touched, because a
+        slot at or beyond ``length`` is never read, and the next forward either
+        overwrites it or leaves it unreachable. ``high_water_mark`` deliberately
+        stays put — it reports the peak the buffers reached, which truncating
+        does not un-happen.
+
+        Only shrinking is allowed. Growing ``length`` would publish slots nobody
+        wrote, and the zeros in them would be read as real keys.
+        """
+        if new_length < 0:
+            raise ValueError(f"new_length must be >= 0, got {new_length}")
+        if new_length > self.length:
+            raise ValueError(
+                f"cannot truncate a cache of length {self.length} up to "
+                f"{new_length}; truncate only discards committed tokens"
+            )
+        self.length = int(new_length)
+
     # ---- per-forward operations --------------------------------------------
 
     def write(

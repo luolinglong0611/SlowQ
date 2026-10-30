@@ -46,7 +46,7 @@ from .config import (
     ModelConfig,
     TextFamily,
 )
-from .embedding import EmbeddingEngine, EmbeddingModel, EmbeddingResult
+from .embedding import DocumentIndex, EmbeddingEngine, EmbeddingModel, EmbeddingResult
 from .engine import (
     DEFAULT_MAX_CONTEXT,
     DEFAULT_MAX_NEW_TOKENS,
@@ -54,6 +54,8 @@ from .engine import (
     Engine,
     GenerationResult,
     GenerationStep,
+    Session,
+    SessionReuse,
     StopReason,
     recorded_task,
 )
@@ -66,7 +68,14 @@ from .errors import (
     WeightError,
 )
 from .metrics import GenerationMetrics, environment_info, peak_rss_bytes
-from .model import CausalLMModel, DebugProbe, DecoderModel, DecoderOutput, ForwardResult
+from .model import (
+    CausalLMModel,
+    DebugProbe,
+    DecoderModel,
+    DecoderOutput,
+    ForwardResult,
+    PrefillResult,
+)
 from .sampling import Sampler, SamplingParams
 from .tokenizer import ChatMessage, IncrementalTextDecoder, Tokenizer
 from .weights import Manifest, TensorSpec, Weights
@@ -83,6 +92,7 @@ __all__ = [
     "DebugProbe",
     "DecoderModel",
     "DecoderOutput",
+    "DocumentIndex",
     "EmbeddingEngine",
     "EmbeddingModel",
     "EmbeddingResult",
@@ -100,9 +110,12 @@ __all__ = [
     "KVCache",
     "Manifest",
     "ModelConfig",
+    "PrefillResult",
     "Sampler",
     "SamplingError",
     "SamplingParams",
+    "Session",
+    "SessionReuse",
     "SlowQError",
     "StopReason",
     "TASK_IMAGE_TEXT_GENERATION",

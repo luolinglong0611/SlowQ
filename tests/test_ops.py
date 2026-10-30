@@ -218,6 +218,38 @@ def test_softmax_of_the_hf_masking_constant_keeps_finite_rows():
     np.testing.assert_allclose(out, [[1.0, 0.0, 0.0]], atol=1e-6)
 
 
+def test_softmax_leaves_its_input_alone():
+    """``group_query_attention`` hands those scores back as the pre-softmax value.
+
+    An in-place exponential would still sum to one and still pass every numerical
+    check, while quietly breaking that contract — so the input is compared against
+    a copy taken beforehand rather than trusted.
+    """
+    rng = np.random.default_rng(11)
+    x = (rng.normal(size=(4, 9)) * 5).astype(F32)
+    before = x.copy()
+    out = softmax(x)
+    np.testing.assert_array_equal(x, before)
+    assert not np.shares_memory(out, x)
+
+
+@pytest.mark.parametrize("scale", [1e-6, 1.0, 30.0])
+def test_softmax_matches_the_three_temporary_form_bit_for_bit(scale: float):
+    """Pins the reference spelling of max-shift, exponential and division.
+
+    Exact equality, not a tolerance: an in-place rewrite that folds these three
+    temporaries into one buffer has to land on the same FP32 numbers or it is a
+    different operator. (One was tried; it measured inside the noise, so the
+    explicit form stayed and this is what would catch a silent change.)
+    """
+    rng = np.random.default_rng(5)
+    x = (rng.normal(size=(5, 17)) * scale).astype(F32)
+    shifted = x - np.max(x, axis=-1, keepdims=True)
+    exponentiated = np.exp(shifted, dtype=np.float32)
+    reference = exponentiated / np.sum(exponentiated, axis=-1, keepdims=True)
+    np.testing.assert_array_equal(softmax(x), reference)
+
+
 def test_sigmoid_does_not_overflow_or_warn_for_very_negative_input():
     x = np.array([-1e4, -200.0, -88.0, 0.0, 88.0, 200.0, 1e4], dtype=F32)
     # ``1 / (1 + exp(-x))`` would overflow for x < -88; any warning is a failure.
@@ -227,6 +259,53 @@ def test_sigmoid_does_not_overflow_or_warn_for_very_negative_input():
     assert np.all(np.isfinite(out))
     assert out[0] == 0.0 and out[-1] == 1.0
     assert out[3] == pytest.approx(0.5, abs=1e-6)
+
+
+def masked_sigmoid(x: np.ndarray) -> np.ndarray:
+    """The two-branch, boolean-masked form ``sigmoid`` replaced.
+
+    Spelled out here rather than trusted from memory: the branchless version is
+    only acceptable if it produces *these* numbers, so the comparison below is
+    exact and covers the values where the two could plausibly diverge.
+    """
+    out = np.empty_like(x)
+    positive = x >= 0
+    out[positive] = F32(1.0) / (F32(1.0) + np.exp(-x[positive], dtype=np.float32))
+    exp_negative = np.exp(x[~positive], dtype=np.float32)
+    out[~positive] = exp_negative / (F32(1.0) + exp_negative)
+    return out
+
+
+@pytest.mark.parametrize(
+    "x",
+    [
+        # The signed zeros (``-0.0 >= 0`` selects the positive branch in both
+        # forms), the overflow boundary at +-88, the saturating ends, and the
+        # non-finite values an activation should never hold but must survive.
+        np.array(
+            [0.0, -0.0, 1e-45, -1e-45, 87.9, -87.9, 88.0, -88.0, 100.0, -100.0,
+             1e30, -1e30, np.inf, -np.inf, np.nan,
+             np.finfo(np.float32).min, np.finfo(np.float32).max,
+             np.finfo(np.float32).tiny],
+            dtype=F32,
+        ),
+        (np.random.default_rng(1).normal(size=100000) * 50).astype(F32),
+        np.linspace(-1e6, 1e6, 100001).astype(F32),
+    ],
+)
+def test_sigmoid_matches_the_masked_form_bit_for_bit(x: np.ndarray):
+    reference = masked_sigmoid(x)
+    got = sigmoid(x)
+    np.testing.assert_array_equal(np.isnan(got), np.isnan(reference))
+    finite = ~np.isnan(reference)
+    np.testing.assert_array_equal(got[finite], reference[finite])
+
+
+def test_sigmoid_does_not_write_into_its_input():
+    x = (np.random.default_rng(2).normal(size=(4, 64)) * 20).astype(F32)
+    before = x.copy()
+    sigmoid(x)
+    np.testing.assert_array_equal(x, before)
 
 
 def test_silu_equals_x_times_sigmoid_x():
@@ -371,3 +450,46 @@ def test_group_query_attention_is_causal_when_masked():
     np.testing.assert_allclose(
         context[0, :, 0], np.array([0.0, 0.5, 1.0], dtype=F32), atol=1e-6
     )
+
+
+# --------------------------------------------------------------------------- #
+# skipping an all-zero mask
+#
+# ``model.encode`` passes ``mask=None`` for a one-token forward. Everything below
+# is the justification for that, checked rather than assumed.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("total_keys", [1, 2, 17, 512])
+def test_a_single_query_at_the_last_position_masks_nothing(total_keys: int):
+    mask = causal_attention_mask(1, total_keys, position_offset=total_keys - 1)
+    assert mask.shape == (1, 1, 1, total_keys)
+    assert not mask.any(), "a decode step's causal triangle is the whole prefix"
+
+
+def test_only_a_single_query_block_can_be_all_zeros():
+    """``num_queries <= 1`` is the exact condition, not a heuristic.
+
+    Two queries ending at the same position still have a triangle: the first one
+    has a key after it. Skipping the mask there would let it attend forward.
+    """
+    assert not causal_attention_mask(1, 5, position_offset=4).any()
+    assert causal_attention_mask(2, 5, position_offset=3).any()
+
+
+def test_an_all_zero_mask_and_no_mask_give_the_same_context_bit_for_bit():
+    rng = np.random.default_rng(21)
+    q = rng.normal(size=(4, 1, 8)).astype(F32)
+    k = rng.normal(size=(2, 11, 8)).astype(F32)
+    v = rng.normal(size=(2, 11, 8)).astype(F32)
+    zeros = np.zeros((1, 1, 1, 11), dtype=F32)
+    masked, _ = group_query_attention(q, k, v, 2, 8**-0.5, zeros)
+    unmasked, _ = group_query_attention(q, k, v, 2, 8**-0.5, None)
+    np.testing.assert_array_equal(masked, unmasked)
+
+
+def test_softmax_treats_negative_and_positive_zero_the_same():
+    """``-0.0 + 0.0`` is ``+0.0``: the only place the two paths can differ at all."""
+    negative = np.array([[-0.0, 1.0, -2.0]], dtype=F32)
+    positive = np.array([[0.0, 1.0, -2.0]], dtype=F32)
+    np.testing.assert_array_equal(softmax(negative), softmax(positive))

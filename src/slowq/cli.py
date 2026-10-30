@@ -31,6 +31,7 @@ from .weights import MANIFEST_FILENAME
 CHAT_BANNER = """慢炖 · SlowQ chat  (CPU, FP32, NumPy only)
 Commands: /clear reset history · /history show history · /help · /exit (or Ctrl-D)
 Ctrl-C during an answer cancels that turn and returns to the prompt.
+Turns reuse the KV cache of the prefix they share with the last one.
 """
 
 
@@ -125,6 +126,14 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--system", default=None, help="optional system message")
     chat.add_argument(
         "--quiet", action="store_true", help="suppress per-turn statistics on stderr"
+    )
+    chat.add_argument(
+        "--no-reuse",
+        action="store_true",
+        help="give up the session KV cache and re-prefill the whole history every "
+        "turn, the way chat behaved before sessions existed; costs a second cache "
+        "allocation's worth of memory to keep, so it is here to compare against, "
+        "not to leave on",
     )
     chat.set_defaults(handler=_cmd_chat)
 
@@ -344,8 +353,26 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     if args.system:
         history.append(ChatMessage(role="system", content=args.system))
 
+    # A chat re-renders its whole history every turn, so without a session each
+    # turn re-prefills everything the earlier turns already computed. The session
+    # buys that back for the price of a second cache; --no-reuse exists so the two
+    # can be compared on the same conversation rather than argued about.
+    session = None if args.no_reuse else engine.session()
+    if session is not None and not args.quiet:
+        print(
+            f"[session] KV reuse on — a second cache of {engine.max_context} tokens, "
+            f"{human_bytes(session.cache.allocated_bytes())} reserved",
+            file=sys.stderr,
+        )
+
     print(CHAT_BANNER, file=sys.stderr)
     print(f"[sampler] {sampling.describe()}", file=sys.stderr)
+
+    def stream_turn():
+        runner = session if session is not None else engine
+        return runner.stream(
+            history, sampling=sampling, max_new_tokens=args.max_new_tokens
+        )
 
     while True:
         try:
@@ -361,6 +388,10 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         if user_input == "/clear":
             system = [m for m in history if m.role == "system"]
             history = system
+            if session is not None:
+                # Clearing the text without clearing the cache would leave the
+                # next turn matching a prefix of a conversation it is not having.
+                session.reset()
             print("[history cleared]", file=sys.stderr)
             continue
         if user_input == "/history":
@@ -376,9 +407,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
             answer_parts: list[str] = []
             sys.stdout.write("SlowQ> ")
             result = None
-            for step in engine.stream(
-                history, sampling=sampling, max_new_tokens=args.max_new_tokens
-            ):
+            for step in stream_turn():
                 sys.stdout.write(step.text_delta)
                 sys.stdout.flush()
                 answer_parts.append(step.text_delta)
@@ -387,7 +416,10 @@ def _cmd_chat(args: argparse.Namespace) -> int:
             sys.stdout.write("\n")
             sys.stdout.flush()
         except KeyboardInterrupt:
-            # The next request resets the cache, so cancelling here is safe.
+            # Cancelling is safe on both paths. A plain request resets the cache
+            # when the next one starts; a session records each commit as the
+            # decoder makes it, so the half-written reply is already accounted for
+            # and the next turn's prefix match simply stops before it.
             print("\n[cancelled]", file=sys.stderr)
             history.pop()
             continue
@@ -396,6 +428,12 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         history.append(ChatMessage(role="assistant", content=result.text))
         if not args.quiet:
             _print_stats(result.metrics.report(), header="stats")
+            if session is not None:
+                print(
+                    f"  {'session cache':<24} {session.cached_tokens} tokens reusable "
+                    f"after {session.turns} turn(s)",
+                    file=sys.stderr,
+                )
     return 0
 
 
@@ -502,6 +540,14 @@ def _load_vision_engine(args: argparse.Namespace) -> Any:
         args.model,
         max_context=args.max_context,
         prefill_chunk_size=args.prefill_chunk_size,
+        # Both callers answer one question about one image and exit, so the
+        # feature cache can only cost here: it hashes the prepared pixels to look
+        # up an entry no second request will ever ask for. Measured on
+        # SmolVLM-256M, that hash is 15 ms for a 5-frame image and 28 ms for a
+        # 9-frame one, against a ~2.5 s request — small, and buying nothing.
+        # The library default stays on, which is where asking a second question
+        # about the same picture actually happens.
+        image_cache_bytes=0,
     )
     print(
         f"loaded in {engine.load_seconds:.2f} s "

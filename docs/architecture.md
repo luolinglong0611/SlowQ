@@ -317,6 +317,18 @@ KV cache 的大小与参数量没有直接关系。
 3. **容量不足必须抛错，绝不静默截断或覆盖。** `check_capacity` 在写入前检查；
    写入失败时 cache 保持原样（`length` 不变）。
 
+不变量 2 有一个**显式的例外**：`Engine.session()` 返回的 `Session` 持有自己的
+cache，跨请求**不** reset——那正是它存在的理由（§6.1）。例外只落在 `Session`
+身上，`stream_ids` 的独立请求路径照旧每次 reset，所以两个普通请求之间不可能
+互相看见对方的 KV。
+
+`truncate(new_length)` 是 `reset()` 的推广，同样只动 `length`：把 cache 缩回一段
+**已经是正确前缀**的历史，供 `Session` 在"这一轮的历史与上一轮不完全相同"时对齐
+到最长公共前缀。它拒绝增长（`new_length > length`）和负数，缩掉之后被放弃的槽位
+在下一次写入之前不可读——`length` 是唯一的读取边界，`truncate` 不清零内存，
+和 `reset` 一样靠"写覆盖读之前一定先写"来保证正确。`truncate(0)` 与 `reset()`
+等价，但两者都**不清除历史峰值水位**。
+
 存进 cache 的 K 是**已经过 q_norm/k_norm（如果该家族有）和 RoPE 的**，所以分块
 边界不会改变任何 token 的绝对位置。
 `tests/test_model.py::test_chunk_boundaries_do_not_shift_positions` 直接比较 cache
@@ -350,6 +362,44 @@ causal_attention_mask(num_queries=T, num_keys=S, position_offset=offset)
 
 唯一允许的差异是 FP32 归约顺序带来的噪声。真实模型上实测 rel_l2 在 1e-5 量级以内
 （`tests/real_models.py` 的 `INTERNAL_REL_L2_TOLERANCE`，比跨实现门限紧 100 倍）。
+
+**只有最后一个 chunk 做词表投影。** 生成只从最后一个 token 采样，所以 512 token
+的 prompt 在 `chunk_size=128` 下需要 1 次投影而不是 4 次。`CausalLMModel.prefill()`
+对非末 chunk 走 `encode()`（decoder stack + KV 写入，不碰 `lm_head`），末 chunk 走
+`forward()`（`encode()` + 一次投影）。
+
+省掉的是**权重读取流量**，可以按字节算而不必靠计时猜：Qwen3-0.6B 的 `lm_head` 是
+`[151936, 1024]` FP32 = 593 MiB 只读权重，投影一个位置就要把它整张读一遍，
+所以被丢掉的三次投影是 1.7 GiB 流量。同一次 prefill 里 decoder stack 约
+1680 MiB（权重逻辑体积 2273.8 MiB 减掉这张表）也要按 chunk 读 4 次，即 6.6 GiB，
+两者相加约 8.3 GiB，投影占约 26%——**它是可观的一笔，但不是唯一的大头**，
+不要把它读成"prefill 的耗时几乎全在投影上"。
+
+**26% 是流量占比，不是耗时占比，两者差了一个数量级。** 直接测一次投影的代价：
+`forward` 就是 `encode` 加一次投影（`model.py:390-398`），所以在同一棵树、同一批
+id、同一个进程里成对计时再相减，得到的就是一次投影的净代价。Qwen3-0.6B 上是
+**4.49 / 8.37 / 5.57 ms**（128 / 256 / 512 token）——投影的代价与块长无关，所以
+这三个数是同一个量的三次独立测量，它们的离散度就是这个探针自身的精度。
+取中位 5.57 ms，三次被跳过的投影约 16.7 ms，对 base 侧 1003.6 ms 的 512-token
+分块 prefill 是 **1.66%**：这个量级落在本轮观测到过的跨进程离散度以内
+（同一配置两个独立进程：Qwen3-0.6B 3.0%、SmolLM2-360M 0.4%——**只有两点，没有分布**，
+所以它不是一个可以拿来判读的「噪声底线」，判读一律写
+`尚不能确认收益或回退`，见[第 1 轮报告](推理加速-第1轮-2026-10-23.md) §7.2），
+也只占同一 prefill 上 `sigmoid` 改写所省时间的约 6%。
+五个模型的每次投影代价从 SmolLM2-135M 的 0.86 ms（49152 × 576）到
+Qwen3-1.7B 的 11.04 ms（151936 × 2048），跟 `vocab_size × hidden_size` 走。
+**所以这一项该保留（免费、且逐位相同），但不能当成实测加速来报。**
+探针：`tools/perf/projection_probe.py`，
+结果与两条独立归因路线的交叉核对见
+[第 1 轮报告](推理加速-第1轮-2026-10-23.md)。
+
+这不是近似：chunk 序列、执行顺序、cache 状态都没变，而 `forward` 本身就是
+`encode` 加这一次投影，所以末位 logits 与"每个 chunk 都 forward 再取最后一个"
+**逐位相同**（`test_prefill_matches_projecting_every_chunk_exactly` 就是拿两者比）。
+`kv_cache.commit` 仍然每个 chunk 一次、在 `encode` 内部，§4 的不变量不受影响。
+一个**要求观测 `logits` 的 DebugProbe 会让每个 chunk 都投影**：分块下末 chunk 的
+记录本来就覆盖前面的，probe 报出来的东西不变，但调试运行可以慢、不可以算出
+另一个结果。`prefill_chunks` 记的仍是实际前向次数，不是投影次数。
 
 分块不是性能优化，是**内存上界**：一次 prefill 2048 token 的 attention 分数矩阵是
 `[16, 2048, 2048]` FP32 = 256 MiB，分块后峰值只与 chunk 大小有关。
@@ -418,6 +468,68 @@ GenerationResult(text, token_ids, prompt_token_ids, stop_reason, metrics)
 在加载时拒绝并指名正确入口，好过构造出一个 causal LM、然后在第一次前向里因为缺
 `lm_head` 失败。`CausalLMModel.__init__` 是第二道同样的检查。
 
+### 6.1 多轮会话：`Engine.session()`
+
+`stream_ids` 每次请求都 reset cache（§4 不变量 2），所以两个普通请求之间**不可能**
+互相看见对方的 KV。聊天要的恰恰相反：每一轮都把完整历史重新渲染一遍，第 *n* 轮的
+prompt 就是第 *n-1* 轮的 prompt 加上模型刚写的那段回答——这部分 cache 已经算过了。
+
+```python
+session = engine.session()                      # 自己的一份满尺寸 cache
+r1 = session.generate([{"role": "user", "content": "什么是 KV cache？"}])
+r2 = session.generate(history + [{"role": "user", "content": "那它占多少内存？"}])
+r2.metrics.reused_tokens                        # 实际复用的 prompt token 数
+session.last_reuse.describe()                   # reused / prefilled / discarded
+session.reset()                                 # 丢掉前缀，保留分配
+```
+
+**复用边界怎么定。** 每个请求都完整渲染 + 分词整段历史，再用
+`common_prefix_length(cached_ids, new_ids)` 比**token id**，不是比文本。BPE 在轮次
+边界上会把同样的词切成不同的 id（`"hello"` 与 `"hello</s>"` 不是同一次 merge），
+按文本比会得到一个"看起来对、实际错位"的边界；按 id 比最多是**少复用**（多花
+prefill 时间），不会**多复用**（让模型基于一段它没见过的对话继续）。代码里没有任何
+地方假设新 prompt 是旧 prompt 的延长，所以编辑或删掉早先的一条消息只是把边界往前
+挪，cache `truncate` 到那里、剩下的重算。
+
+五个必须处理的细节：
+
+- **完全命中也要跑一个 token。** cache 里存的是最后一个 prompt token 的 K/V，
+  而生成采样的是它的 **logits**——那份 logits 从没算过，因为会产生它的 token 是
+  上一轮回答的停止符，decode 循环不会把它喂回模型（§6）。所以 `reuse == len(ids)`
+  时 `start = len(ids) - 1`，代价是一次单 token 前向，不是整段 prefill。
+- **失败或被取消的请求会让 cache 比会话记录更长。** prefill 是逐 chunk commit 的，
+  中途抛异常时已完成的 chunk 已经写进去了。`_plan` 先 `del self._committed[length:]`
+  把没记录的尾巴丢掉再比前缀：复用边界永远不会超过记录过的长度，而边界之后的槽位
+  要么被这次 prefill 覆盖，要么落在 `length` 之外没人读。
+- **模型身份变了必须拒绝，不能猜。** 会话钉住创建时的 engine；`_check_identity`
+  每次请求比对 `model` 对象与 `(层数, KV head 数, head_dim, vocab, max_context)`。
+  buffer 是按**旧**几何分配的，几何变了还继续写就是把 K/V 写进当前模型会当成别的东西
+  来读的槽位——输出错、但不报错。几次整数比较换掉这个后果是划算的。
+- **图文请求不支持。** 图文 prefill 会用视觉塔产出的特征替换 prompt 里的嵌入行，
+  而一段缓存的前缀没有记录自己来自哪张图。`VisionEngine` 走自己的路径，`_stream`
+  直接拒绝这个组合。
+- **完成的轮次在交付时计数，不在生成器耗尽后计数。** `turns` 原本在
+  `yield from self._stream(...)` **之后**自增，而 `yield from` 只有在生成器正常结束时
+  才返回：调用方在最后一步之后 `close()`、或者用完即弃让 GC 收掉它，
+  `GeneratorExit` 就抛在那个 `yield` 上，于是一个**已经完成并交付**的请求被报成
+  `turns=0`，下一轮的前缀复用也跟着少算一轮。自增现在紧贴最后一步 `yield` **之前**。
+  反向的错误同样要守：计数不能跑到它所报告的复用前面去
+  （`test_a_turn_counted_at_delivery_does_not_outrun_the_reuse_it_reports`）；
+  中途抛错的 decode **不**计数（`test_a_decode_that_raises_mid_stream_does_not_count_the_turn`）；
+  正常耗尽**只**计一次（`test_exhausting_a_stream_counts_the_turn_exactly_once`）——
+  `_stream` 恰好 yield 一个 `finished` 步骤然后返回，所以"紧贴它之前"这个位置
+  两条路径都只会经过一次。
+
+**代价。** 会话分配**自己的一份**满尺寸 cache，不借用 engine 的那份：借用意味着
+中间任何一次 `engine.generate()` 都会把对话冲掉。`max_context=2048` 的 Qwen3-0.6B
+上这是额外约 448 MiB（§4 的每 token 表 × 2048）。`reset()` 清前缀但保留分配。
+`Session` 与 `common_prefix_length`、`SessionReuse` 都住在 `engine.py` 里——
+依赖边界（§13）是一份固定的模块清单，为一个类新开模块不值得。
+
+CLI 的 `slowq chat` 用会话，`--no-reuse` 关掉它走每轮重新 prefill 的老路径；
+每轮打印复用比例，`/clear` 同时清对话和 cache。两条路径**给出相同回答**由
+`tests/test_cli.py` 断言，Ctrl-C 之后会话仍可继续用也在那里断言。
+
 ---
 
 ## 7. 任务二：文本向量
@@ -477,10 +589,142 @@ vector: [1024] FP32，单位长度
 官方 recipe tokenize 的是原文，一个不带 chat template 的向量 checkpoint 仍然完全
 可用。`render_chat()` 在这种情况下报错，而不是发明一种格式。
 
-`EmbeddingEngine.search()` 是 SlowQ 全部的检索支持：一个 query 对一批 document，
-返回向量和按余弦降序的索引。**没有向量库，没有 RAG 管线。**
+`EmbeddingEngine.search()` 是一个 query 对一批 document，返回向量和按余弦降序的
+索引。**没有持久化向量库，没有 ANN，没有 RAG 管线。**
 `encode_many()` 是顺序编码，不是批处理——官方 recipe 的 padding 只是为了把一批
 塞进一次前向，逐条编码得到相同的向量而不需要 padding。
+
+### 7.1 预编码索引：`index_documents()`
+
+`search()` 每次调用都把**每个 document 重新编码一遍**。一个 query 时这是答题的
+真实成本；同一批文档问 N 次就是 N×M 次编码，而 M 次就够。
+
+```python
+index = engine.index_documents(corpus)          # M 次编码，一次付清
+batch, ranking = index.search("第一个问题")       # 1 次编码 + 一次矩阵乘
+batch, ranking = index.search("第二个问题")
+```
+
+`DocumentIndex` 是**进程内的、不落盘的**一份 `[M, H]` FP32 矩阵加原文；打分走的
+是同一个 `rank_documents()`，document 走的也是同一个 `encode_document()`
+（原文、不加指令前缀），所以 `index.search(q)` 与 `engine.search(q, corpus)`
+返回**逐位相同**的向量、相似度与排序——`tests/test_embedding.py` 就是这么断言的
+（`np.array_equal`，不是 `allclose`）。`search()` 的签名与行为没有变。
+
+**谁拥有那个数组。** `EmbeddingResult` 是 frozen dataclass，而 frozen 冻的是
+**属性绑定**，不是它指向的数组：`result.vector` 不能重新赋值，
+`result.vector[:] = 0` 照样写穿。一个既存下结果、之后又把它们交回调用方的对象，
+因此必须说清缓冲区归谁，`DocumentIndex` 的答案是**自己持有私有副本、出门时再拷一次**
+（`detached()`，只拷 `vector`——`text` 是 `str`、`input_ids` 是 `tuple`，
+共享它们不构成别名）。
+
+**两条路都得拷**：`__init__` 的调用方可能继续写它传进来的 results，
+`results` / `search()` 的调用方可能继续写它拿回去的东西。只在一端拷会把另一端留着。
+不拷的后果是这个 bug 最难发现的形态——调用方把一个文档的向量清零之后，
+**后续每次查询都在给整个语料重新打分**，而分数看起来仍然像余弦相似度，
+同时 `engine.search()`（重新编码）还是给出正确答案，两边对不上却都不报错。
+`vectors` 属性是**每次访问重新 `np.stack`** 而不是存一份，同样是这个道理：
+一千个单位向量的 stack 是微秒级，对面是一次完整 prefill 的 query 编码。
+代价在 `detached` 的 docstring 里写明了（每文档 `hidden_size` 个 float32，
+一千个 Qwen3-Embedding-0.6B 文档 4 MiB），而且**拷贝在索引 A/B 的计时窗口之内**，
+所以下面那些倍数是含拷贝的。
+测试：`test_mutating_the_arrays_handed_to_the_constructor_does_not_reach_the_index`、
+`test_mutating_a_vector_read_from_results_does_not_reach_the_index`、
+`test_mutating_a_vector_returned_by_search_does_not_reach_the_index`、
+`test_a_mutated_index_still_agrees_with_a_fresh_search`、
+`test_the_vector_matrix_is_a_copy_the_caller_cannot_write_through`。
+
+**什么时候值得建索引。** 建索引花 M 次编码，而 `search()` **每条查询**也花 M 次编码，
+所以**打平点在第 1 条查询**，不是"要先查很多次才回本"。实测
+（Qwen3-Embedding-0.6B，语料 16 篇 / 409 token，`artifacts/perf-round1-rerun/documents/`，
+每格是同一进程内 3 个计时轮的中位数）：建索引 **878.6 ms [875.2–951.6]**，
+一条查询省下的 document 编码 **876.3 ms**（8 条查询共 7.0107 s）。
+两个量都随语料大小线性增长，**所以打平点与语料规模无关**；查询越多省得越多——
+一整轮 8 条查询，`engine.search` 是 **7478.9 ms [7443.9–7738.8]**，
+`index.search` 是 **430.9 ms [429.2–433.5]**，**每轮都重建索引**也只要
+**1309.5 ms**（harness 直接测的"建索引 + 一整轮"是 1319.1 ms [1307.8–1382.5]）。
+这些数字**含上面那份拷贝的代价**。第 1 轮报告里那句"只查一次则不划算"
+就是这么被推翻的：它是拿"建索引要先花钱"这句直觉写的，没有除过。
+
+**失效条件。** 索引记住建它时的身份，每次 `search` 前比对，不一致就报错而不是
+给出用旧向量算出来的排序：
+
+| 比对项 | 变了意味着 |
+| --- | --- |
+| 模型对象 | 换了一个 engine |
+| tokenizer 对象 | 同一段文本会切成别的 id |
+| `prefill_chunk_size` | 浮点求和顺序变了 |
+| `Weights.fingerprint()` | 目录被重新转换或指向了别的 checkpoint |
+
+`prefill_chunk_size` 进这张表是因为**分块只保证 rel_l2 ≤ 2e-4 的等价，不保证逐位
+相同**（§5）。差这么多的向量仍然可比，但它们不是这个索引建起来时的那一批，而猜
+"是哪一侧动了"不值得冒这个险。
+
+`max_length` **故意不在表里**：它只决定什么被**拒绝**，索引里没有任何一个向量是
+截断编码出来的（SlowQ 报 `ContextOverflowError` 而不截断），事后放宽上限不改变
+已存的数字。`dimension` 同理——维度不同就是模型不同，模型对象那一项已经拦住了。
+
+`Weights.fingerprint()` 是这一轮为"派生值缓存"加的身份，一个可哈希的 7 元组：
+目录绝对路径、`format_version`、`model_family`、`task`、`compute_dtype`、
+`source_revision`，以及排序后的张量表 `((name, shape, dtype), …)`。
+**它只读 manifest，不读任何张量的数值**（`test_the_fingerprint_reads_no_tensor`
+把 `Weights.get` 换成会记录的桩来守这一点）。
+
+**这个选择的代价与替代方案的代价都测过**（`tools/perf/identity_cost.py`）。下表
+读的是 `artifacts/probe-rerun-20261028/identity/`：SmolVLM-256M 三个独立进程 +
+Qwen3-1.7B 一个，`vlm.py` 的 AST 哈希 `e4a22324…` **与当前源码逐字符相同**，
+所以表里的数字就是这份代码的代价。
+
+| 量 | SmolVLM-256M | Qwen3-1.7B |
+| --- | --- | --- |
+| manifest 条目数 / 张量逻辑体积 | 471 / 978.4 MiB | 310 / 6563.5 MiB |
+| `fingerprint()` 中位数 | **0.0301–0.0304 ms** | **0.0238 ms** |
+| 替代方案：sha256 全部权重 | **0.395–1.62 s** | **8.489 s** |
+| 它想省掉的那次视觉编码 | 2.53–4.09 s | — |
+
+更早那一批 `artifacts/perf-round1-rerun/identity/`（同样三个进程，`vlm.py` 是
+问题 2 修复**之前**的 `77167e65…`）给出 fingerprint **0.0286–0.0295 ms** /
+**0.0224 ms**，与上表同量级。两批可以并列引用是因为 `fingerprint()` 住在
+`weights.py`，而 `weights.py` 的 AST 哈希在两批之间**没有变**（`b041e6f6…`）；
+`vlm.py` 变了，所以那一批里凡是走 `vlm.py` 的量（视觉编码、像素哈希）只能当
+旁证，不能当当前代码的数值。
+
+**还有第三批 `artifacts/probe-rerun-20261029/identity/`**（SmolVLM-256M 三个独立
+进程 + Qwen3-1.7B 一个），`vlm.py` 与 `weights.py` 的 AST 哈希与上表那批**完全相同**
+（`e4a22324…` / `b041e6f6…`）。它不是重测数值路径：这一轮给 `identity_cost.py`
+自己加了输出预检（见 §12.4），探针的 AST 哈希因此变了，而
+`tests/test_perf_tooling.py` 那条自指门禁要求**最新的 artifact 必须出自树里这一份探针**，
+所以重测是被门禁要求的，不是可选的。逐项对比（上表那批 → 这一批）：
+fingerprint **0.0301–0.0304 → 0.0281–0.0299 ms**，整个身份检查
+**0.0326–0.0331 → 0.0306–0.0321 ms**，5 帧像素哈希 **16.25–16.62 → 15.44–15.92 ms**，
+9 帧 **28.24–29.65 → 27.73–28.70 ms**，`miss/disabled` **0.980–1.016 → 0.999–1.021**，
+`hit/miss` **0.696%–0.725% → 0.680%–0.703%**，Qwen3-1.7B fingerprint
+**0.0238 → 0.0240 ms**。两批的 `bit_identical` 全为 true、`max_abs_difference` 恒为 0.0。
+唯一明显移动的是**替代方案那次全权重 sha256**：上表那批是 0.395–1.62 s（三次里两次
+mmap 页已驻留），这一批是 **1.552–1.598 s**（三次都没驻留，宿主机 swap 用量 738 MiB
+对上一批的 674 MiB）——它按设计**最后只跑一次**，正是探针里唯一预期会随页缓存状态
+大幅移动的量，所以 `vlm.py` 里那个占比区间相应放宽到 **15.4%–60.3%**。
+本文正文引用的仍是上表那一批；两批同哈希、可互相复核。
+
+**字节多 6.7 倍反而更便宜**，因为代价跟 manifest 条目数走、不跟张量字节数走——
+这正是它在大模型上付得起的原因。一次运行内部 200 次调用的极差
+（三次运行分别是 0.0299–0.0524、0.0295–0.0359、0.0297–0.0405 ms）
+比三个进程之间的中位数移动（0.0301–0.0304 ms）宽两个量级，
+所以**中位数可以作为区间引用，单次调用不可以**。
+
+本节早先写的是「为一次『省掉一次前向』的缓存去哈希 500 MiB FP32，
+比它省下的那次前向还贵」。**那句对 SmolVLM 是错的**：0.395–1.62 s 只有该次编码的
+**15.4%–39.7%**，并不比前向贵（区间这么宽是 mmap 页是否已驻留）。
+它只在 Qwen3-1.7B 上成立。**结论没变（不选它），理由换了**：
+不是"比前向贵"，是"为保护一次前向而每次请求付几百毫秒到几秒"，这本身就自我抵消。
+选 fingerprint 就要接受下面那个缺口。
+
+由此带来的缺口是**故意且很窄的**：已经加载好的 engine 之下如果有人就地改写了
+`.npy`，fingerprint 不变——但那个 engine 持有的 mmap 也不变，所以缓存值仍然等于
+这个 engine 会算出来的东西。换目录、换精度、重新转换都会改到上面某一项。
+**换掉整个 engine 对象**则由 §8.5 的 `_model_identity_changed()` 拦住：
+fingerprint 是缓存 key 的一部分，但它不会自动重算，所以每次查缓存前还要比一次
+当前模型对象的身份，变了就整表作废。
 
 ---
 
@@ -646,6 +890,18 @@ Engine.stream_ids(token_ids, prefill_embeds=(features, mask),
 - **`_merge_inputs_embeds` 拿 mask 的和与特征行数对账，而不是相信调用方。**
   数量不符时报错并说明"两边对不上，没有正确的对齐方式"，而不是丢掉图像特征
   或者把它们写到文本 token 上。
+- **对账必须在任何 KV 写入之前完成。** `inputs_embeds` 与 `inputs_embed_mask`
+  描述的是**整个 block**，不是一个 chunk：图像占位 token 可以跨 chunk 边界，
+  特征行按 prompt 顺序随 chunk 前进逐段发出。所以 `prefill()` 先用
+  `_checked_inputs_embeds` 校验**整块**输入，通过了才开始切 chunk；
+  `forward()` 走同一个校验，两条路径对同一个错误块给出**同一个**报错。
+  这条早先不成立：校验只在 `_merge_inputs_embeds` 内部、也就是**逐 chunk**发生，
+  一个行数不够的 features 会让前几个 chunk 已经把 KV 提交进去，
+  缓存停在半提交状态，而报错说不清是哪一侧不对。
+  `test_a_rejected_prefill_leaves_an_existing_cache_exactly_as_it_was`
+  逐字节比对拒绝前后的 `k` / `v` 与 `_committed`，把"没有半提交"变成可检验的断言；
+  `test_prefill_refuses_fewer_rows_before_the_earlier_chunks_commit` 直接守这条时序；
+  `test_prefill_and_forward_refuse_the_same_block_identically` 守两条路径的一致性。
 
 消息用**结构化 content**（`[{"type": "image"}, {"type": "text", ...}]`）渲染，
 因为 SmolVLM 的模板会索引 `message['content'][0]['type']`；传纯字符串会在 Jinja
@@ -657,6 +913,179 @@ content），直接渲染调用方准备好的模板变量。
 图像缺失、读不出来、模式不支持（调色板 / 灰度 / 16-bit）、占位符数量对不上、
 扩展后超过 `max_context`，都给出说明原因的错误，不静默截断或忽略图像。
 SlowQ 也不抓 URL：传路径，或者传一个已经加载好的 `PIL.Image.Image`。
+
+### 8.5 图像特征缓存：`ImageFeatureCache`
+
+视觉编码占首 token 延迟的 81%~87%（§8.4 实测），而**同一张图问第二个问题时它
+一模一样**。`VisionEngine` 因此带一个 connector 特征缓存，默认
+`image_cache_bytes=128 MiB`：
+
+```python
+engine = VisionEngine.from_directory(model_dir)          # 缓存默认开
+engine.generate_image(path, "图里有什么？")                # 跑视觉塔，存下特征
+engine.generate_image(path, "一共有几个格子？")            # 命中，视觉塔不跑
+engine.image_features.stats()                             # hits / misses / evictions / bytes
+engine = VisionEngine.from_directory(model_dir, image_cache_bytes=0)   # 关掉
+```
+
+**只存 `VisionOutput.features`，不存整个 `VisionOutput`。** 后者还带 `per_frame`
+和 `encoder_output`，而 `encoder_output` 是视觉塔自己 hidden size 上的东西：
+9 帧的 SmolVLM-256M 图实测 27.0 MiB，而 decoder 真正吃的特征只有 1.3 MiB。
+存整个输出等于花 20 倍内存跳过同一次前向。`features` 是正确的边界，因为它恰好是
+`stream_prompt` 交给 prefill 的东西，而它上游的一切正是缓存要避免重算的。
+
+这个边界同时保住了调试与验证路径：`tools/validate_reference.py`、
+`tests/test_vlm.py`、`tests/test_integration_vlm.py` 读的是 `encoder_output` 与
+`per_frame`，走 `VisionModel.encode` / `SmolVLMModel.encode_image`，**两个方法都
+不经过缓存**，只有 `stream_prompt` 经过。另外**带 `DebugProbe` 的请求双向绕过
+缓存**——既不读也不写：`ALL_CAPTURES` 里的名字全是 decoder 侧的，命中也能填满，
+但 probe 的语义是"给我看这次请求算了什么"，用上一次请求的特征回答的是另一个问题。
+
+**缓存身份**（`_image_cache_key`，一个可哈希元组）包含四件事，因为"命中"必须意味着
+"算出来的是同一批数字"：
+
+| 组成 | 为什么在里面 |
+| --- | --- |
+| 预处理后 pixel_values 与 attention mask 的 blake2b 摘要 + 形状 | 按**像素内容**而不是按文件路径：两个不同文件预处理成同样的像素就该共享，同一个文件用不同的预处理配置就不该 |
+| crop 网格 `rows`/`cols`、`image_seq_len`、三个尺寸 | 它们决定特征要填多少个 `<image>` 占位 token |
+| `ImageProcessorConfig`（frozen dataclass，全是标量与 float 元组，自身可哈希） | 任何 resize / 归一化 / `image_seq_len` 改动都失效 |
+| `Weights.fingerprint()`（§7.1） | 换 checkpoint、换精度都失效 |
+
+**key 里有 fingerprint 不等于换模型会失效，fingerprint 相同也不等于模型相同。**
+fingerprint 描述的是 **manifest**——哪个目录、哪种格式、哪张张量表——所以在同一个
+`Weights` 上用**不同配置**建出来的两个模型，fingerprint **完全相同**。
+`dataclasses.replace` 改一个合法的计算参数（`vision.layer_norm_eps`）、改一个预处理
+参数（`processor.image_mean`），在同一份权重上重建模型再绑到 `engine.model` 上：
+形状对得上、行数对得上、什么都不报错，请求正常返回，**而它用的是上一个模型的特征**。
+这是"换权重"那个修复之后剩下的洞。
+
+所以身份是 `_vision_identity()` 的五元组：`Weights.fingerprint()` +
+`config.vision` + `config.processor` + `config.image_token_id` + `config.scale_factor`，
+而 `_model_identity_changed()` 在**每次查缓存之前**比两样东西：
+
+1. **模型对象本身**，用 weak reference 而不是 `id()`——id 会在对象被回收后复用，
+   一个复用来的 id 会和它替换掉的那个模型比较相等；`is` 骗不了，死引用返回 `None`，
+   那也不是当前模型。
+2. **值身份**，即上面那个五元组，覆盖对象身份覆盖不到的"同权重、不同配置"。
+
+任一样变了就整表作废、丢掉所有不可达条目。绑到一个算出同样数字的对象上，代价是
+一次重算——缓存**不试图**区分"等价"和"以某个配置字段没记录的方式变了"。
+**不受支持的替换明确拒绝**：绑一个没有 `vlm_config` 的对象（文本模型）会让
+`_vision_identity()` 抛 `TypeError`，点名"支持的是 `SmolVLMModel` 实例"，
+而不是从刷新逻辑深处抛一个 `AttributeError` 说某个字段不存在，
+也不是留着旧配置、继续用一个新模型根本没有的视觉塔算出来的特征。
+
+审查明确要求这**不得**通过扫描权重来实现：它读的是 manifest
+（**0.0281–0.0304 ms**，当前源码的**九个**独立进程——`artifacts/perf-round1-rerun/`、
+`artifacts/probe-rerun-20261028/`、`artifacts/probe-rerun-20261029/` 三个根各三个
+SmolVLM 进程，最宽 8.00%；最早那根 `vlm.py` 还是修复前的 `77167e65…`，
+但 `fingerprint()` 住在 `weights.py`、其 AST 哈希三根之间没变（`b041e6f6…`），
+所以**这一个量**可以三根并列，见 §7.1），不是张量（0.395–1.62 s，见 §7.1 的表）。
+**整个检查**——那次 fingerprint、建配置元组、一次弱引用解引用、一次比较——
+实测 **0.0306–0.0331 ms**（这一项只有后两个根记录了 `identity_layers`，
+所以是**六个**进程），是它包着的那次裸 fingerprint 的 **1.07–1.09 倍**：
+把配置也盖进来，给一个本来就是百分之三毫秒的调用加了不到十分之一。
+200 次调用里 `changed_count` 恒为 **0**，即未替换时这条路径不误报、持续命中。
+探针把三层分开计时（`fingerprint` ⊂ `identity_tuple` ⊂ `identity_check`），
+所以配置比较的成本没有藏在一个总数里。
+
+测试用**真实模型对象替换**验证，不是手动改私有 fingerprint 来模拟：
+
+| 覆盖点 | 测试 |
+| --- | --- |
+| 同权重、不同 vision 配置 | `test_a_swapped_vision_config_over_the_same_weights_does_not_serve_the_old_features` |
+| 同权重、不同预处理配置 | `test_a_swapped_preprocessor_config_refreshes_the_preprocessor_and_the_entry` |
+| 不同权重（上一轮已有的替换） | `test_swapping_the_model_does_not_serve_the_previous_models_features` |
+| 替换后首次重算、之后重新命中 | `test_a_swapped_engine_rewarms_and_then_hits_again`、`test_a_config_swap_rewarms_and_then_hits_again` |
+| 未替换时持续命中 | `test_requests_without_a_swap_keep_hitting` |
+| 结果与当前模型直接计算一致 | `test_a_swapped_vision_config_over_the_same_weights_does_not_serve_the_old_features`（`assert_array_equal`，见下）、`test_the_cache_does_not_change_the_answer` |
+| 命中路径不扫描权重张量 | `test_the_identity_check_reads_the_manifest_and_no_tensor` |
+| 不受支持的替换明确拒绝 | `test_a_text_only_model_is_refused_rather_than_served_from_the_cache` |
+| probe 仍然双向绕过缓存 | `test_a_probe_still_bypasses_the_cache_after_a_swap` |
+
+"同权重、不同 vision 配置"那条同时对齐了**数值**：它拿 `other.encode_image(image).features`
+（当前模型直接算的结果）与替换后缓存给出的数组做 `assert_array_equal`，
+不是只断言"这次是 miss"。fixture 自己先被两道断言夹住——
+`other.weights.fingerprint() == original.weights.fingerprint()`（否则它就退化成
+换权重那条测试）、`not np.array_equal(expected, first)`（否则特征没变，miss 无意义）。
+它是对**未修复的代码**复现出来的：那时 `_model_identity_changed` 只比
+`weights.fingerprint()`，manifest 是同一份 manifest，于是相等、提前返回，
+旧条目被交给新塔的调用方，而形状与行数全都对得上。
+
+**容量与所有权。** 有上限、按 LRU 淘汰；`max_bytes=0` 关闭，负数报错。
+`put` 拷进去、`get` 拷出来，所以调用方改自己拿到的特征数组不会污染缓存条目，
+两个请求也永远不会持有同一个 buffer。实测这次拷贝是 720 KiB / 0.009 ms 与
+1.3 MiB / 0.016 ms，对面是约 2.3 s 的视觉塔——差五个数量级，不值得为省拷贝
+去共享 buffer。比整个预算还大的条目**跳过而不入缓存**，不会把缓存反复清空。
+
+**三条路径的代价都测了，身份检查算在里面。** `identity_cost.py` 对每张验证图跑
+`disabled` / `miss` / `hit` 三条路径各 5 次，下表读的是 SmolVLM-256M 三个独立进程
+（`artifacts/probe-rerun-20261028/identity/`，`vlm.py` AST 哈希 = 当前源码）。
+**这不是全部**：第三批 `artifacts/probe-rerun-20261029/identity/` 同样三个进程、
+同样对得上当前源码，它的 `miss/disabled` 是 **0.999–1.021**、`hit/miss` 是
+**0.680%–0.703%**，与下表同量级；为什么会有第三批、两批逐项差多少见 §7.1。
+下表只列第二批的原始秒数、不与第三批合并：秒数是**同进程内配对**才有意义的量，
+跨根凑分子分母会把宿主机状态差异算成缓存的代价（表格下面那段讲的就是这件事）：
+
+| 路径 | 5 帧（1x4 网格） | 9 帧（2x4 网格） |
+| --- | --- | --- |
+| 缓存关闭 `disabled` | 2.3035–2.3976 s | 4.1302–4.1656 s |
+| 首次未命中 `miss` | 2.3113–2.3607 s | 4.1766–4.2053 s |
+| 重复命中 `hit` | 0.0164–0.0166 s | 0.0292–0.0304 s |
+
+`miss / disabled` = **0.980–1.016**：开着缓存的第一次请求和关掉缓存的请求
+一样贵，缓存**没有**给冷路径加钱。`hit / miss` = **0.00696–0.00725**，
+即命中是未命中的 **0.70%–0.73%**。命中路径里那次身份检查占
+**0.107%–0.203%**（`identity_share_of_hit`）——命中剩下的部分几乎全是像素哈希本身
+（5 帧 25.0 MiB @ ~1.5 GiB/s ≈ 15.4–16.6 ms，正好是那一行的量级）。
+
+**这两个比值是「同一个（进程, 图）配对内」算出来的，区间是 6 个配对值的最小／最大**
+（5 帧图 run1/2/3 = 0.9804 / 1.0034 / 1.0089，9 帧图 run1/2/3 = 1.0026 / 1.0140 / 1.0156，
+与 `derived.miss_to_disabled` 里那 6 个数逐项相同）。
+这一点必须写清楚，因为换一种配对方式会得到另一个数：在**同一张图**内跨三个进程
+凑分子分母（`min(miss)/max(disabled)` 到 `max(miss)/min(disabled)`），5 帧图是
+**0.964–1.025**、9 帧图是 **1.003–1.018**；要是连两张图也不分开，得到的是
+**0.55–1.83**——那不是缓存的代价，是 4.1 s 的 9 帧去除 2.3 s 的 5 帧。
+跨运行那两种读法把进程间离散度算进了比值里，看着像「缓存给冷路径加了 2.5%」，
+而分子分母来自不同进程，比的已经不是同一件事。
+`derived` 里的 `miss_to_disabled` / `hit_to_miss` / `identity_share_of_hit`
+都是**逐运行**记录的，所以上表那个区间没有跨运行混搭。
+
+**输出一致性是逐位比较的，不是看聚合误差。** 同一次运行里，三条路径各自的特征
+都与绕过缓存直接调 `encode_image` 的结果比，另外还比 `hit` 与 `miss`：
+四个比较项（`disabled_vs_direct`、`miss_vs_direct`、`hit_vs_direct`、`hit_vs_miss`）
+在 **6 个（图, 进程）组合上全为 true**，`max_abs_difference` **恒为 0.0**。
+
+**计时必须反映这次请求真正做的事。** 命中时 `vision_encode_seconds` 里只剩查表
+（那次像素哈希），**不是**早先那个跑了视觉塔的请求的时长；`vision_cache_hit`
+说明是哪一种，`GenerationMetrics.report()` 在命中时把那一行印成
+`16.0 ms (features cached, vision tower skipped)`。
+
+`slowq vlm` 这个 CLI 入口**显式传 `image_cache_bytes=0`**：它一次进程只回答一个
+问题就退出，缓存在那里只有成本没有收益——为一张不会有第二个问题的图去哈希像素。
+那次哈希实测是 **5 帧 15.41–16.62 ms、9 帧 27.73–29.65 ms**（当前源码的**九个**独立
+进程，`tools/perf/identity_cost.py` → 三个根的 `identity/`），
+对面那次视觉编码是 **2.43–4.09 s**，占 **0.39%–1.21%**，
+很小，但买不到任何东西。库的默认值仍然是开的，因为"就同一张图再问一句"发生在
+库里，不在这个命令里。
+
+**这个区间为什么把 `artifacts/perf-round1-rerun/identity/`（`vlm.py` 还是问题 2
+修复前的 `77167e65…`）也算进来**，与 §7.1 那句「只能当旁证」需要一起读：问题 2 改的是
+**键里装什么、身份怎么比**，不是那两次 `blake2b`——而这一项计时几乎全是那两次哈希。
+但 AST 哈希是**文件级**的，它分不出"改了别处"和"改了这里"，所以那一根**不能单独**
+当作当前代码的数值。可以并列是因为另外两个根（六个进程，`vlm.py` = `e4a22324…`
+= 当前源码）单独给出 **5 帧 15.44–16.62 ms、9 帧 27.73–29.65 ms**，
+与九进程区间只差 5 帧的下端点 15.44 对 15.41：最早那一根没有把区间拉宽，
+它落在当前源码自己给出的区间里面。§7.1 里那句「只能当旁证」说的正是这个地位——
+**旁证，不是来源**；`vlm.py` 的 `_image_cache_key` docstring 引用九进程区间，
+`tests/test_perf_tooling.py` 要求区间盖住每一份保留下来的运行，两处一致。
+
+被哈希的是 `pixel_values` **与 int64 attention mask 两个数组**，mask 恰好占
+被哈希字节的 **40%**（5 帧 15.0 + 10.0 = 25.0 MiB，9 帧 27.0 + 18.0 = 45.0 MiB），
+速率 **1.47–1.56 GiB/s**（更早那一批 1.49–1.58 GiB/s）。本节早先写的是
+「15.6 ms / 28.2 ms，按 15.0 / 27.0 MiB
+约 1 GB/s」——毫秒数没错，**速率的分子漏了 mask**，只算 `pixel_values`
+会把一个 1.5 GiB/s 的哈希器说成慢 40%。
 
 ---
 
@@ -670,7 +1099,7 @@ SlowQ 也不抓 URL：传路径，或者传一个已经加载好的 `PIL.Image.I
 | `load_seconds` | 读 `config.json` / `manifest.json`、mmap 权重、编译 chat template | 下载、转换；也**不含把权重 page-in**——mmap 是惰性的，第一个前向才真正读盘 |
 | `tokenize_seconds` | 渲染 chat template + BPE 编码 | — |
 | `vision_encode_seconds` | 每一帧过视觉塔 + connector | **图像预处理**（解码、resize、切 crop、prompt 扩展）在 `build_prompt` 里，不计入 |
-| `prefill_seconds` | 所有 prefill 前向（每个 chunk），含 KV 写入与图像特征融合 | tokenize、视觉编码、采样 |
+| `prefill_seconds` | 这次请求**实际跑过**的 prefill 前向（每个 chunk），含 KV 写入与图像特征融合 | tokenize、视觉编码、采样；**复用到的那部分历史不产生任何时间** |
 | `first_token_seconds` | `tokenize + vision_encode + prefill + 第一次采样`，从请求开始计 | 模型加载 |
 | `decode_seconds` | 首 token 之后每一步的 forward + sample | 消费者在两次 yield 之间做的事 |
 | `total_seconds` | `tokenize + vision_encode + 从请求开始到结束的墙钟时间` | 模型加载 |
@@ -680,14 +1109,33 @@ SlowQ 也不抓 URL：传路径，或者传一个已经加载好的 `PIL.Image.I
 向量任务用的是 `EmbeddingResult.encode_seconds`，它覆盖分块 prefill 与 pooling，
 不含 tokenize。
 
+两个字段会让上面两行"变小"，所以必须一起看：
+
+- **`vision_encode_seconds` 在缓存命中时只含查表**（那次像素哈希），**不是**早先
+  那个真跑了视觉塔的请求的时长（§8.5）。`vision_cache_hit` 说明是哪一种，
+  `report()` 在那一行后面加上 `(features cached, vision tower skipped)`。
+  命中时 `report()` 也会打印这一行，即使它是 16 ms——"这一行只在 >0 时打印"
+  的规则因此改成"只在图文请求时打印"。
+- **`prefill_seconds` 在会话复用时只覆盖新 prefill 的那段**（§6.1），而
+  `prompt_tokens` 仍然是整段渲染后历史的 token 数。两者不再成比例，所以
+  `prefill_tokens_per_second` 除的是 `prefill_tokens = prompt_tokens - reused_tokens`，
+  不是 `prompt_tokens`：一次复用了 90% 历史的请求，报出来的吞吐是它真跑的那 10%
+  的吞吐，而不是一个虚高 10 倍的数字。
+
 token 计数：
 
 - `prompt_tokens` 是**渲染后 chat template 的 token 数**，不是用户原文的字数。
   图文请求里它包含全部 image token（grid-2x4 是 612，其中 576 个来自图像）。
   prefill 吞吐必须按模型真正吃进去的量算。
+- `reused_tokens` 是**K/V 已经在 cache 里、因此没有产生 prefill 的 prompt token 数**。
+  独立请求恒为 0（`stream_ids` 开头就 reset），只有 `Engine.session()` 能给非零值。
+  `prefill_tokens` 是它的补集。`report()` 只在 `reused_tokens > 0` 时多打一行
+  `KV reuse  128/142 cached (90%), 14 prefilled`——理由同上：每个普通请求都印一行
+  "0 tokens" 是噪声，不是信息。
 - `decode_tokens = max(generated_tokens - 1, 0)`，即去掉第一个 token。
   `decode_tokens_per_second` 因此是稳态速率，不被 prefill 拉低。
-- `prefill_chunks` 是实际执行的前向次数。
+- `prefill_chunks` 是实际执行的前向次数，**不是投影次数**：分块 prefill 只在末
+  chunk 投影（§5），但每个 chunk 都算一次前向。
 
 `tools/benchmark.py` 的微观 prefill 探针把**两种模式分开报**，因为它们是两条不同的
 代码路径：`full` 走一次覆盖整段的前向，`chunked` 走引擎真正跑的分块循环。两者的
@@ -973,25 +1421,69 @@ import 全部 14 个运行时模块后，`sys.modules` 共 268 个模块，其�
 
 ```
 默认（快速）   python -m pytest -m "not integration"
-              685 passed, 62 deselected，验证工具修复轮实测 6.42 s（macOS arm64；
-              发布前修复轮是 665 passed / 5.42 s，当时宿主机 swap 已用 7.4 GiB / 8 GiB，
-              空载约 4.1 s——耗时随宿主机压力浮动，通过项数不受影响）
-              去掉标记过滤直接 pytest -q 则是 685 passed, 62 skipped：
+              1042 passed, 62 deselected，2026-10-28 在最终树上重复跑了多次，
+              **每一次都是 1042 passed / 62 deselected、rc=0**（macOS arm64；
+              耗时在 22–24 s 之间浮动，逐次记录、落盘位置与「为什么不必无限重跑」
+              见 [测试与数值验证](validation.md) §快速测试）
+              推理加速第 1 轮当时是 826 passed / 5.58 s；同一份代码在 Qwen3-1.7B
+              集成测试占着 6 GiB 内存时重跑是 6.93 s，上一轮 685 passed / 6.42 s，
+              再上一轮 665 passed / 5.42 s，那一轮宿主机 swap 已用 7.4 GiB / 8 GiB，
+              空载约 4.1 s；审查修复轮 995 passed / 13.08 s——
+              耗时随宿主机压力与测试项数浮动，通过项数不受影响
+              去掉标记过滤直接 pytest -q 则是 1042 passed, 62 skipped：
               那 62 项集成测试因未设 SLOWQ_MODEL_DIR 而跳过
               使用 tests/conftest.py 现场构造的微型 checkpoint 与真正的
               byte-level BPE tokenizer，不下载任何权重，全程离线
+              1042 = 826 + 169 + 47，其中 test_perf_tooling.py 从 135 涨到 176、
+              test_vlm.py 从 105 涨到 111，其余 15 个文件一项没变。
+              逐文件收集数已用 --collect-only 在最终树上重算（2026-10-28）：
+              validation.md §快速测试 的增量表逐文件对得上，995 → 1042（+47），
+              收集总数 1057 → 1104
 
 显式启用      SLOWQ_MODEL_DIR=models/<name>-slowq python -m pytest -m integration
               每个目录收集 62 项，manifest 里的 task 决定哪些模块运行、
               哪些整模块跳过并打印原因
-              发布前修复轮 8 个模型合计 208 passed、0 failed（验证工具修复轮未重跑；
-              8 份日志留在本机 artifacts/repair-review-20261021/developer-integration-logs/，
-              该目录被 .gitignore 忽略，不随仓库分发）；
-              其中 Qwen3-1.7B 单独复跑耗时 4036.71 s，正确性回归已通过，
-              异常耗时与宿主机内存压力、页面调入调出相符但尚未做对照测量，
-              见 validation.md「Qwen3-1.7B 的异常耗时与宿主机内存压力相符」
+              推理加速第 1 轮 8 个模型合计 208 passed、0 failed，本轮跑了两次
+              （优化 1+2 之后、优化 1~4 全部完成之后），两次逐目录结果完全相同；
+              审查四处修复之后（2026-10-26）又跑了一次，仍是 208 passed、0 failed、
+              288 skipped，逐目录 passed/skipped 与前两次**逐项相同**；
+              上一轮（发布前修复轮）同样是 208 passed。快速层一路涨上来
+              665 → 685 → 826 → 995 → 1042（+20、+141、+169、+47，逐文件增量见
+              validation.md §快速测试），集成层的通过项数一次都没动过——
+              新增的全是快速测试，没有一项进集成层
+              日志留在本机 artifacts/perf-round1/integration-opt12/、
+              integration-opt4/、artifacts/perf-round1-rerun/integration-fixed/
+              与 integration-final/（最后这个是采集结束后按最终树重跑的那一遍，
+              10-27 02:43，逐目录 passed/skipped 与前几遍逐项相同；
+              二次审查修复轮的在 artifacts/perf-run-20261028-185623/
+              integration-round2/，10-28，8/8 退出码 0、合计同样 208 passed；
+              上一轮的在 artifacts/repair-review-20261021/
+              developer-integration-logs/），这些目录都被 .gitignore 忽略，
+              不随仓库分发
+              其中 Qwen3-1.7B 已在这台机器上跑出过 57.17 s（审查修复后的树）、
+              115.37 s 与 3828.08 s（第 1 轮那棵树，两处只差 docstring）、
+              3935.49 s（二次审查修复后的树）四个值，
+              上一轮发布前修复那棵树还有过 4036.71 s——这四个值里最慢与最快差 69 倍。
+              **3935.49 s 落在慢档里，本轮也没能把它测快**：它不是新出现的回退，
+              而是同一个双峰分布在修复之后又取到了慢的那一峰。
+              3828.08 s 那一个窗口**采到了点样本**
+              （10 GiB 处于 compressed 状态、vm.compressor_bytes_used 约 9.3 GiB、
+              pytest 逻辑 RSS 5.98 GiB 而 top 常驻只有 126 MiB、CPU/墙钟 = 24%），
+              115.37 s、57.17 s 与 3935.49 s 那三个窗口**没有采系统指标**
+              （3935.49 s 那一遍的 driver.log 只记了起止时间戳与逐模型标题，
+              没有 swap 用量、没有压缩器字节数、也没有 RSS 时间序列）。内存压缩／换页
+              因此仍是一个*假设*：变量是被观测而非被操纵的，快的那一侧没有对照指标，
+              也没有时间序列。能下的结论只有一条——这个模型的集成测试**耗时**
+              在这台机器上不可用来判断代码快慢（它在四棵不同的树上取过
+              57.17 s / 58.74 s / 115.37 s 与 3828.08 s / 3935.49 s / 4036.71 s，
+              六个值里最慢 ÷ 最快 = 4036.71 / 57.17 = **70.6 倍**，
+              而这几棵树之间的代码差别远小于这个倍数），
+              正确性结论不受影响。**「由宿主机内存压力支配」本轮没有当成确定原因写**，
+              理由见 validation.md 那一节。
+              见 validation.md 的「2026-10-23 推理加速第 1 轮的实际执行结果」
+              与「2026-10-26 审查修复后的实际执行结果」
 
-合计          747 个测试被收集（685 快速 + 62 集成）
+合计          1104 个测试被收集（1042 快速 + 62 集成）
 ```
 
 集成测试按任务分成四个模块，过滤条件只有一个来源——目录自己的 manifest：
@@ -1007,14 +1499,34 @@ import 全部 14 个运行时模块后，`sys.modules` 共 268 个模块，其�
 一个文本生成目录跑出来的 `26 passed, 36 skipped` 说明另外两个任务的模块根本没运行，
 不能当成完整集成验证。8 个模型的逐项结果见[测试与数值验证](validation.md)。
 
-快速套件里四个文件是**工具层**的回归测试，不是模型层的：
-`test_validate_reference.py`（111）、`test_convert_model.py`（30）、
-`test_benchmark.py`（27）、`test_dependency_boundary.py`（6）。它们守的不是
+快速套件里五个文件是**工具层**的回归测试，不是模型层的：
+`test_perf_tooling.py`（**176**，新增文件，未进任何提交）、`test_validate_reference.py`（111）、
+`test_convert_model.py`（30）、`test_benchmark.py`（29）、`test_dependency_boundary.py`（6）。
+这五个收集数都在最终树上用 `--collect-only` 逐个重算过（2026-10-28），与本报告的 1042
+来自同一棵树：后四个自上一轮以来未变，`test_perf_tooling.py` 从 135 增到 176
+（二次审查轮的 +41：`out_guard` 与三个驱动的输出目录规则、剔除轮次后重算 AB/BA 均衡
+与四个判定档位、两个驱动的累计失败退出码、以及 §10 期望值跟着新运行根走；
+**这 41 项按问题拆开各占几项本轮给不出来**，磁盘上没有上一轮那份文件的副本可比对，
+理由与可验证的替代口径见 validation.md §快速测试）。
+上一轮那批里，3 项守 `run_reference.sh`
+的汇总表——每一列都必须出自本次运行自己产生的日志；
+`test_the_pre_round1_identity_row_counts_the_models_it_actually_covers` 守文档散文里的
+逐字节断言——§2.2 那行"与 pre-round1 备份逐字节相同"必须带上它实际覆盖的模型数、
+滤掉计时行后的模型数、以及把两个数分开的那个模型名。它们守的不是
 "算得对不对"，而是"工具在失败时会不会说谎、会不会破坏数据"——转换失败留下混杂
 权重、比较器对 NaN 或缺失张量判 PASS、基准报告没有真正执行的分块，这三类问题的
 共同点是**结果看起来正常**。v0.1 新增的回归测试都逐个验证过：撤掉对应的修复，
 它们会失败。v0.2 发布前修复那一轮新增的 19 项、验证工具修复那一轮新增的 20 项
 同样逐个负向验证过，逐条记录在[v0.2 报告 §6.6 与 §6.8](v0.2-多模型接入报告.md)。
+
+`test_perf_tooling.py` 守的是第四类问题：**测量工具会不会把它没测的东西说成测过**。
+它按路径 `importlib` 加载 `tools/perf/` 下的每个探针与驱动，因此要求它们
+`main(argv=None)` 且模块级不解析 `sys.argv`（否则 pytest 加载时会被吃掉自己的参数）；
+用正则把源码 docstring 里引用的**每一个区间**抽出来，断言**所有保留的运行都落在区间内**
+（端点按各自十进制位数四舍五入后比较，且要求 `low < high`，一个区间不可能塌成点估计），
+再断言最新一次运行记录的**代码哈希**（清空 docstring 后重算的那一个）仍与当前源码一致；
+还钉住成本模型的定性性质——身份检查的代价跟 manifest **条目数**走、不跟张量**字节数**走
+（Qwen3-1.7B 的权重字节多 6.7 倍，fingerprint 反而更便宜）。
 
 那 20 项里有 4 项专门守"测试有没有真的执行被测函数"这件事：
 把 `_reference_embedding_capture` 的函数体第一句换成 `raise AssertionError`，

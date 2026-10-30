@@ -19,8 +19,24 @@ Definitions used everywhere in SlowQ (also documented in docs/architecture.md):
     largest single cost of the request. Resizing and normalising the frames
     happens earlier, in prompt construction, and is not included here.
 
+    When :class:`slowq.vlm.VisionEngine` serves an image it has seen before, the
+    tower does not run at all and this is only the time spent hashing the pixels
+    to look them up — never the duration of the earlier request that did the work.
+    ``vision_cache_hit`` says which of the two happened.
+
 ``prefill_seconds``
-    Wall time of all prefill forwards (every chunk), including the KV writes.
+    Wall time of the prefill forwards this request actually ran (every chunk it
+    ran), including the KV writes. A session turn that reuses cached KV runs
+    fewer chunks, so this shrinks while ``prompt_tokens`` stays the same — see
+    ``reused_tokens``.
+
+``reused_tokens``
+    Prompt tokens whose K/V was already in the cache and therefore cost no
+    prefill. Always 0 for a standalone request, because ``Engine.stream_ids``
+    resets the cache first; only ``Engine.session`` can produce a nonzero value.
+    ``prefill_tokens`` is the complement, and it — not ``prompt_tokens`` — is
+    what ``prefill_tokens_per_second`` divides by, so a reused turn does not
+    report throughput for work it skipped.
 
 ``first_token_seconds``
     Time-to-first-token: ``tokenize_seconds`` + ``prefill_seconds`` + the first
@@ -152,10 +168,24 @@ class GenerationMetrics:
     prompt_tokens: int = 0
     generated_tokens: int = 0
     prefill_chunks: int = 0
+    reused_tokens: int = 0
+    #: True when an image+text request found its connector features already
+    #: cached and therefore never ran the vision tower. Always False for a text
+    #: request, which has no image to look up.
+    vision_cache_hit: bool = False
     stop_reason: str = ""
     weight_logical_bytes: int = 0
     kv_allocated_bytes: int = 0
     peak_rss_bytes: int = field(default_factory=peak_rss_bytes)
+
+    @property
+    def prefill_tokens(self) -> int:
+        """Prompt tokens this request really pushed through the decoder stack.
+
+        ``prompt_tokens - reused_tokens``. Equal to ``prompt_tokens`` for every
+        standalone request, since those start from a reset cache.
+        """
+        return self.prompt_tokens - self.reused_tokens
 
     @property
     def decode_tokens(self) -> int:
@@ -170,9 +200,9 @@ class GenerationMetrics:
 
     @property
     def prefill_tokens_per_second(self) -> float:
-        if self.prefill_seconds <= 0 or self.prompt_tokens == 0:
+        if self.prefill_seconds <= 0 or self.prefill_tokens == 0:
             return float("nan")
-        return self.prompt_tokens / self.prefill_seconds
+        return self.prefill_tokens / self.prefill_seconds
 
     def report(self) -> list[tuple[str, str]]:
         rows = [
@@ -181,10 +211,27 @@ class GenerationMetrics:
             ("generated tokens", str(self.generated_tokens)),
             ("tokenize", f"{self.tokenize_seconds * 1e3:.1f} ms"),
         ]
-        if self.vision_encode_seconds > 0:
+        if self.vision_encode_seconds > 0 or self.vision_cache_hit:
             # Only image+text requests have one, so a text run's report is
             # unchanged rather than gaining a permanent row of zeros.
-            rows.append(("vision encode", f"{self.vision_encode_seconds * 1e3:.1f} ms"))
+            detail = f"{self.vision_encode_seconds * 1e3:.1f} ms"
+            if self.vision_cache_hit:
+                # The tower did not run for this request, so what is left in the
+                # number is the pixel hash. Saying so is the difference between
+                # "this image was cached" and a suspiciously fast encode.
+                detail += " (features cached, vision tower skipped)"
+            rows.append(("vision encode", detail))
+        if self.reused_tokens > 0:
+            # Same reasoning: a standalone request reused nothing, and printing
+            # "0 tokens" on every generate call would be noise, not information.
+            share = 100.0 * self.reused_tokens / self.prompt_tokens if self.prompt_tokens else 0.0
+            rows.append(
+                (
+                    "KV reuse",
+                    f"{self.reused_tokens}/{self.prompt_tokens} cached ({share:.0f}%), "
+                    f"{self.prefill_tokens} prefilled",
+                )
+            )
         rows.extend(
             [
                 ("prefill", f"{self.prefill_seconds * 1e3:.1f} ms"),
@@ -211,6 +258,9 @@ class GenerationMetrics:
             "generated_tokens": self.generated_tokens,
             "decode_tokens": self.decode_tokens,
             "prefill_chunks": self.prefill_chunks,
+            "reused_tokens": self.reused_tokens,
+            "prefill_tokens": self.prefill_tokens,
+            "vision_cache_hit": self.vision_cache_hit,
             "decode_tokens_per_second": self.decode_tokens_per_second,
             "prefill_tokens_per_second": self.prefill_tokens_per_second,
             "stop_reason": self.stop_reason,

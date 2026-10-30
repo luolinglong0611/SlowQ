@@ -231,6 +231,66 @@ def test_reset_then_refill_overwrites_the_stale_slots(cache: KVCache):
     np.testing.assert_allclose(keys, np.full((KV_HEADS, 2, HEAD_DIM), -7.0, np.float32))
 
 
+def test_truncate_keeps_the_prefix_and_drops_the_tail(cache: KVCache):
+    """A session reuses a prefix, so discarding tokens must not disturb it."""
+    fill(cache, layer=0, start=0, count=6)
+    cache.commit(6)
+    before = cache.keys[0].copy()
+
+    cache.truncate(3)
+
+    assert cache.length == 3
+    assert cache.remaining == 5
+    # Pure bookkeeping: the buffers are untouched, which is also the point — the
+    # dropped slots are past ``length`` and no read can reach them.
+    np.testing.assert_array_equal(cache.keys[0], before)
+    keys, _ = cache.read(0, total_length=3)
+    np.testing.assert_array_equal(keys, before[:, :3, :])
+
+
+def test_truncate_to_zero_is_reset_without_clearing_the_high_water_mark(cache: KVCache):
+    cache.commit(6)
+    cache.truncate(0)
+    assert cache.length == 0
+    # The peak really happened; pretending otherwise would understate the memory
+    # a conversation reached, which is the one thing the mark is for.
+    assert cache.high_water_mark == 6
+
+
+def test_truncate_leaves_the_dropped_slots_unreadable(cache: KVCache):
+    fill(cache, layer=0, start=0, count=5)
+    cache.commit(5)
+    cache.truncate(2)
+    keys, _ = cache.read(0, total_length=cache.length)
+    assert keys.shape[1] == 2
+
+
+def test_truncate_refuses_to_grow_the_cache(cache: KVCache):
+    """Publishing slots nobody wrote would let zeros be read as real keys."""
+    cache.commit(3)
+    with pytest.raises(ValueError, match="only discards"):
+        cache.truncate(4)
+    assert cache.length == 3
+
+
+def test_truncate_refuses_a_negative_length(cache: KVCache):
+    cache.commit(3)
+    with pytest.raises(ValueError, match=">= 0"):
+        cache.truncate(-1)
+    assert cache.length == 3
+
+
+def test_a_refilled_tail_overwrites_what_truncate_dropped(cache: KVCache):
+    fill(cache, layer=0, start=0, count=4)
+    cache.commit(4)
+    cache.truncate(2)
+    new = np.full((KV_HEADS, 2, HEAD_DIM), -9.0, dtype=np.float32)
+    cache.write(0, new, new, position_offset=2)
+    cache.commit(2)
+    keys, _ = cache.read(0, total_length=4)
+    np.testing.assert_allclose(keys[:, 2:, :], np.full((KV_HEADS, 2, HEAD_DIM), -9.0, np.float32))
+
+
 def test_repr_reports_the_important_numbers(cache: KVCache):
     cache.commit(3)
     text = repr(cache)

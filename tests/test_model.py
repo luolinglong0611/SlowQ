@@ -22,6 +22,10 @@ from slowq.embedding import EmbeddingEngine
 from slowq.errors import ConfigError, ContextOverflowError
 from slowq.model import DebugProbe, CausalLMModel, load_config_and_weights
 
+#: Patched in the mask tests below: ``encode`` looks these names up in the module
+#: namespace at call time, so replacing them there is what observes the real path.
+import slowq.model as model_module
+
 from conftest import build_tiny_tokenizer, write_tiny_model
 
 #: FP32 matmul reassociation between a long prefill and several short ones.
@@ -210,6 +214,499 @@ def test_two_caches_for_the_same_input_agree(model: CausalLMModel):
     a = model.forward(ids, model.new_cache(32)).logits
     b = model.forward(ids, model.new_cache(32)).logits
     np.testing.assert_array_equal(a, b)
+
+
+# --------------------------------------------------------------------------- #
+# prefill(): the chunk loop with one vocabulary projection
+#
+# The optimisation is "stop projecting chunks whose logits are thrown away".
+# That is only safe if what survives is *the same numbers*, so the identity
+# tests below are exact rather than tolerant: a difference here would mean the
+# chunking changed, not that FP32 reassociated.
+# --------------------------------------------------------------------------- #
+
+
+def run_prefill_loop(model: CausalLMModel, ids: list[int], chunk: int):
+    """The pre-optimisation path: ``forward`` every chunk, keep the last."""
+    cache = model.new_cache(max_context=max(64, len(ids) + 8))
+    result = None
+    for start in range(0, len(ids), chunk):
+        result = model.forward(ids[start : start + chunk], cache)
+    return result, cache
+
+
+IDS = [11, 3, 7, 19, 2, 25, 8, 14, 1, 5, 30, 12]
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 3, 5, 7, len(IDS)])
+def test_prefill_matches_projecting_every_chunk_exactly(model: CausalLMModel, chunk: int):
+    loop, loop_cache = run_prefill_loop(model, IDS, chunk)
+    cache = model.new_cache(max_context=max(64, len(IDS) + 8))
+    result = model.prefill(IDS, cache, chunk_size=chunk)
+
+    np.testing.assert_array_equal(result.logits, loop.logits)
+    np.testing.assert_array_equal(result.hidden_states[-1], loop.hidden_states[-1])
+    # The whole cache, not just its length: decode continues from these slots, so
+    # a K/V difference here would show up as a divergent continuation.
+    for layer in range(model.config.num_hidden_layers):
+        np.testing.assert_array_equal(cache.keys[layer], loop_cache.keys[layer])
+        np.testing.assert_array_equal(cache.values[layer], loop_cache.values[layer])
+    assert cache.length == loop_cache.length == len(IDS)
+
+
+@pytest.mark.parametrize("chunk,expected", [(1, 12), (3, 4), (5, 3), (7, 2), (12, 1), (99, 1)])
+def test_prefill_reports_the_chunks_it_ran(model: CausalLMModel, chunk: int, expected: int):
+    cache = model.new_cache(64)
+    result = model.prefill(IDS, cache, chunk_size=chunk)
+    assert result.chunks == expected
+    assert result.num_tokens == len(IDS)
+    assert result.position_offset == 0
+    assert result.cache_length == len(IDS)
+
+
+def test_prefill_projects_the_vocabulary_once_not_once_per_chunk(
+    model: CausalLMModel, monkeypatch
+):
+    """The point of the change, counted rather than inferred from a timing."""
+    calls: list[int] = []
+    original = model.output_projection
+
+    def counted(hidden):
+        calls.append(np.asarray(hidden).reshape(-1, model.config.hidden_size).shape[0])
+        return original(hidden)
+
+    monkeypatch.setattr(model, "output_projection", counted)
+    model.prefill(IDS, model.new_cache(64), chunk_size=3)
+    assert calls == [1], f"four chunks projected {len(calls)} times: {calls}"
+
+
+def test_a_probe_that_wants_logits_keeps_projecting_every_chunk(
+    model: CausalLMModel, monkeypatch
+):
+    """A debug run may be slow; it may not compute something different."""
+    calls: list[int] = []
+    original = model.output_projection
+
+    def counted(hidden):
+        calls.append(1)
+        return original(hidden)
+
+    monkeypatch.setattr(model, "output_projection", counted)
+    probe = DebugProbe.for_names({"logits"}, positions=(-1,))
+    model.prefill(IDS, model.new_cache(64), chunk_size=3, probe=probe)
+    assert len(calls) == 4, "one projection per chunk, as before the optimisation"
+    # And the value it reports is unchanged: under chunking the last chunk's
+    # record overwrites the earlier ones, so skipping them cannot move it.
+    np.testing.assert_array_equal(
+        probe.records["logits[-1]"],
+        model.prefill(IDS, model.new_cache(64), chunk_size=3).logits,
+    )
+
+
+def test_a_probe_that_does_not_want_logits_does_not_force_the_projections(
+    model: CausalLMModel, monkeypatch
+):
+    calls: list[int] = []
+    original = model.output_projection
+
+    def counted(hidden):
+        calls.append(1)
+        return original(hidden)
+
+    monkeypatch.setattr(model, "output_projection", counted)
+    probe = DebugProbe.for_names({"layer_output", "final_norm"}, positions=(-1,))
+    model.prefill(IDS, model.new_cache(64), chunk_size=3, probe=probe)
+    assert calls == [1]
+    assert "layer0.layer_output[-1]" in probe.records
+
+
+def test_prefill_hidden_states_cover_only_the_last_chunk(model: CausalLMModel):
+    cache = model.new_cache(64)
+    result = model.prefill(IDS, cache, chunk_size=5)
+    assert result.chunks == 3
+    # 12 tokens in chunks of 5 -> 5 + 5 + 2.
+    assert result.hidden_states.shape == (2, model.config.hidden_size)
+    assert result.hidden_states_offset == 10
+    one_chunk = model.prefill(IDS, model.new_cache(64), chunk_size=len(IDS))
+    np.testing.assert_allclose(
+        result.hidden_states, one_chunk.hidden_states[-2:], **CHUNK_TOLERANCE
+    )
+
+
+def test_prefill_continues_from_a_cache_that_is_not_empty(model: CausalLMModel):
+    """Positions come from the cache, so a resumed prefill must not restart them."""
+    prefix, rest = IDS[:4], IDS[4:]
+
+    whole = model.new_cache(64)
+    expected = model.prefill([*prefix, *rest], whole, chunk_size=3)
+
+    split = model.new_cache(64)
+    model.prefill(prefix, split, chunk_size=3)
+    resumed = model.prefill(rest, split, chunk_size=3)
+    assert resumed.position_offset == len(prefix)
+    assert resumed.cache_length == len(IDS)
+    np.testing.assert_allclose(resumed.logits, expected.logits, **CHUNK_TOLERANCE)
+
+
+def test_prefill_scatters_image_features_across_a_chunk_boundary(model: CausalLMModel):
+    """Placeholder tokens straddle chunks, so rows are handed out in prompt order."""
+    hidden = model.config.hidden_size
+    features = np.arange(5 * hidden, dtype=np.float32).reshape(5, hidden) * 0.01
+    mask = np.zeros(len(IDS), dtype=bool)
+    mask[[1, 2, 6, 7, 8]] = True  # two in the first chunk of five, three in the second
+
+    cache = model.new_cache(64)
+    chunked = model.prefill(
+        IDS, cache, chunk_size=5, inputs_embeds=features, inputs_embed_mask=mask
+    )
+    # The same block in one forward: identical inputs, identical merge.
+    single = model.prefill(
+        IDS, model.new_cache(64), chunk_size=len(IDS), inputs_embeds=features,
+        inputs_embed_mask=mask,
+    )
+    np.testing.assert_allclose(chunked.logits, single.logits, **CHUNK_TOLERANCE)
+    assert chunked.chunks == 3
+
+
+def test_prefill_rejects_a_mask_that_does_not_cover_the_block(model: CausalLMModel):
+    cache = model.new_cache(64)
+    with pytest.raises(ValueError, match="covers 3 positions"):
+        model.prefill(
+            IDS,
+            cache,
+            chunk_size=4,
+            inputs_embeds=np.zeros((1, model.config.hidden_size), dtype=np.float32),
+            inputs_embed_mask=np.zeros(3, dtype=bool),
+        )
+    assert cache.length == 0
+
+
+def test_prefill_rejects_placeholders_with_no_features_before_touching_the_cache(
+    model: CausalLMModel,
+):
+    cache = model.new_cache(64)
+    mask = np.zeros(len(IDS), dtype=bool)
+    mask[0] = True
+    with pytest.raises(ValueError, match="no inputs_embeds were supplied"):
+        model.prefill(IDS, cache, chunk_size=4, inputs_embed_mask=mask)
+    assert cache.length == 0, "a rejected prefill must not leave slots behind"
+
+
+# ``prefill`` used to read ``inputs_embeds`` only inside its
+# ``inputs_embed_mask is not None`` branch, and to hand each chunk a *slice* of
+# the rows rather than checking the count against the mask. Two consequences:
+# features passed without a mask were never looked at, and a row count that
+# disagreed with the mask was reconciled by the slice, because ``features[0:1]``
+# of a two-row array is one row and raises nothing. Both produced a completed
+# prefill whose embeddings were silently missing or truncated — the same input
+# given to ``forward`` was refused. The checks now run once over the whole block
+# before the first chunk, through the code ``forward`` also uses.
+
+#: Positions entirely inside the *third* chunk of four over ``IDS``. Illegal
+#: features marked here are the interesting case: two legal chunks would run
+#: first, so a check that fires per chunk rather than up front has already
+#: committed K/V by the time it notices.
+LATE_PLACEHOLDERS = (9, 10, 11)
+
+
+def late_mask() -> np.ndarray:
+    mask = np.zeros(len(IDS), dtype=bool)
+    mask[list(LATE_PLACEHOLDERS)] = True
+    return mask
+
+
+def feature_rows(model: CausalLMModel, count: int, width: int | None = None) -> np.ndarray:
+    """``[count, width]`` features with distinct values, so a dropped row shows."""
+    width = model.config.hidden_size if width is None else width
+    return np.arange(count * width, dtype=np.float32).reshape(count, width) * 0.01
+
+
+def test_prefill_refuses_features_that_come_without_a_mask(model: CausalLMModel):
+    """Silently ignoring them is the failure this exists to prevent.
+
+    The features are well-formed and the prefill would have completed, so nothing
+    downstream could tell the caller their embeddings never reached the decoder.
+    """
+    cache = model.new_cache(64)
+    with pytest.raises(ValueError, match="inputs_embeds require an inputs_embed_mask"):
+        model.prefill(
+            IDS, cache, chunk_size=4, inputs_embeds=feature_rows(model, 2)
+        )
+    assert cache.length == 0
+
+
+def test_prefill_refuses_more_feature_rows_than_the_mask_selects(model: CausalLMModel):
+    """The review's repro: two rows, a mask selecting one token.
+
+    The old cursor took ``features[0:1]`` and dropped the second row without a
+    word, so a truncated image produced a confident answer.
+    """
+    mask = np.zeros(len(IDS), dtype=bool)
+    mask[3] = True
+    cache = model.new_cache(64)
+    with pytest.raises(ValueError) as excinfo:
+        model.prefill(
+            IDS, cache, chunk_size=4, inputs_embeds=feature_rows(model, 2),
+            inputs_embed_mask=mask,
+        )
+    message = str(excinfo.value)
+    assert "expands to 1 placeholder tokens" in message
+    assert "the encoder produced 2 feature rows" in message
+    assert cache.length == 0
+
+
+def test_prefill_refuses_fewer_rows_before_the_earlier_chunks_commit(
+    model: CausalLMModel,
+):
+    """Too few rows used to raise too late to matter.
+
+    The placeholders are all in the third chunk, so chunks one and two are legal
+    and committed their K/V before chunk three's ``forward`` noticed. A caller
+    catching that error was left holding a cache four slots longer than the
+    tokens it had accounted for, and the next prefill would continue from there.
+    """
+    cache = model.new_cache(64)
+    with pytest.raises(ValueError, match="the encoder produced 2 feature rows"):
+        model.prefill(
+            IDS, cache, chunk_size=4, inputs_embeds=feature_rows(model, 2),
+            inputs_embed_mask=late_mask(),
+        )
+    assert cache.length == 0, "a rejected prefill left committed slots behind"
+
+
+@pytest.mark.parametrize(
+    "shape_id", ["one-dimensional", "wrong-hidden-size", "three-dimensional"]
+)
+def test_prefill_refuses_features_that_are_not_a_row_matrix(
+    model: CausalLMModel, shape_id: str
+):
+    """Shape is checked against the model, not against whatever the slice yields.
+
+    The placeholders are late, so before the up-front check these reached
+    ``_merge_inputs_embeds`` only after two chunks had committed — and a
+    one-dimensional array sliced as ``features[0:1]`` arrives there as shape
+    ``(1,)``, which is a different complaint than the one the caller made.
+    """
+    hidden = model.config.hidden_size
+    shapes = {
+        "one-dimensional": (hidden,),
+        "wrong-hidden-size": (len(LATE_PLACEHOLDERS), hidden + 1),
+        "three-dimensional": (len(LATE_PLACEHOLDERS), 1, hidden),
+    }
+    cache = model.new_cache(64)
+    with pytest.raises(ValueError) as excinfo:
+        model.prefill(
+            IDS, cache, chunk_size=4,
+            inputs_embeds=np.zeros(shapes[shape_id], dtype=np.float32),
+            inputs_embed_mask=late_mask(),
+        )
+    assert (
+        f"inputs_embeds must be [n, {hidden}], got {shapes[shape_id]}"
+        in str(excinfo.value)
+    )
+    assert cache.length == 0
+
+
+def test_prefill_refuses_rows_nobody_asked_for(model: CausalLMModel):
+    """An all-false mask selects zero positions, so one supplied row has nowhere to go."""
+    cache = model.new_cache(64)
+    with pytest.raises(ValueError, match="expands to 0 placeholder tokens"):
+        model.prefill(
+            IDS, cache, chunk_size=4, inputs_embeds=feature_rows(model, 1),
+            inputs_embed_mask=np.zeros(len(IDS), dtype=bool),
+        )
+    assert cache.length == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs_id", ["no-mask", "too-many-rows", "wrong-width", "rows-nobody-asked-for"]
+)
+def test_prefill_and_forward_refuse_the_same_block_identically(
+    model: CausalLMModel, kwargs_id: str
+):
+    """One implementation of the rule, so the two entry points cannot drift.
+
+    The mask-length message is excluded on purpose: it names the caller
+    ("this forward" / "this prefill"), which is the one difference that should
+    survive. Everything else has to be the same sentence, because it is the same
+    check.
+    """
+    hidden = model.config.hidden_size
+    one = np.zeros(len(IDS), dtype=bool)
+    one[3] = True
+    cases = {
+        "no-mask": dict(inputs_embeds=feature_rows(model, 2)),
+        "too-many-rows": dict(inputs_embeds=feature_rows(model, 2), inputs_embed_mask=one),
+        "wrong-width": dict(
+            inputs_embeds=feature_rows(model, 3, hidden + 1), inputs_embed_mask=late_mask()
+        ),
+        "rows-nobody-asked-for": dict(
+            inputs_embeds=feature_rows(model, 1),
+            inputs_embed_mask=np.zeros(len(IDS), dtype=bool),
+        ),
+    }
+    kwargs = cases[kwargs_id]
+
+    with pytest.raises(ValueError) as from_prefill:
+        model.prefill(IDS, model.new_cache(64), chunk_size=4, **kwargs)
+    with pytest.raises(ValueError) as from_forward:
+        model.forward(IDS, model.new_cache(64), **kwargs)
+    assert str(from_prefill.value) == str(from_forward.value)
+
+
+def test_a_rejected_prefill_leaves_an_existing_cache_exactly_as_it_was(
+    model: CausalLMModel,
+):
+    """Length *and* contents, over a cache that already holds a legal turn.
+
+    The realistic shape of the bug is a second turn: the conversation so far is
+    committed, an illegal image block arrives, and the caller catches the error
+    and keeps talking. Whether that is safe depends on the refusal happening
+    before any write, which ``cache.length == 0`` cannot express once the cache
+    is not empty.
+    """
+    cache = model.new_cache(64)
+    model.prefill(IDS[:4], cache, chunk_size=4)
+    assert cache.length == 4
+    before = [
+        tuple(array.copy() for array in cache.read(layer, cache.length))
+        for layer in range(model.config.num_hidden_layers)
+    ]
+
+    with pytest.raises(ValueError):
+        model.prefill(
+            IDS[4:], cache, chunk_size=2, inputs_embeds=feature_rows(model, 2),
+            inputs_embed_mask=late_mask()[4:],
+        )
+
+    assert cache.length == 4
+    for layer, (keys, values) in enumerate(before):
+        now_keys, now_values = cache.read(layer, cache.length)
+        np.testing.assert_array_equal(now_keys, keys)
+        np.testing.assert_array_equal(now_values, values)
+
+
+@pytest.mark.parametrize("chunk_size", [12, 7, 5, 4, 3, 1])
+def test_a_late_image_span_still_matches_the_single_chunk_prefill(
+    model: CausalLMModel, chunk_size: int
+):
+    """The up-front check must not change the legal path it now guards.
+
+    ``test_prefill_scatters_image_features_across_a_chunk_boundary`` puts the
+    placeholders in the first two chunks; these are all in the last one, which is
+    the alignment the row cursor has to walk two empty chunks to reach.
+    """
+    features = feature_rows(model, len(LATE_PLACEHOLDERS))
+    mask = late_mask()
+
+    whole = model.prefill(
+        IDS, model.new_cache(64), chunk_size=len(IDS), inputs_embeds=features,
+        inputs_embed_mask=mask,
+    )
+    chunked = model.prefill(
+        IDS, model.new_cache(64), chunk_size=chunk_size, inputs_embeds=features,
+        inputs_embed_mask=mask,
+    )
+    np.testing.assert_allclose(chunked.logits, whole.logits, **CHUNK_TOLERANCE)
+    # And the precondition: merging changed something, so the comparison above is
+    # not two runs of the same embeddings-free prefill agreeing trivially.
+    plain = model.prefill(IDS, model.new_cache(64), chunk_size=len(IDS))
+    assert not np.allclose(whole.logits, plain.logits, **CHUNK_TOLERANCE)
+
+
+def test_prefill_rejects_an_empty_block_and_a_zero_chunk_size(model: CausalLMModel):
+    with pytest.raises(ValueError, match="at least one token"):
+        model.prefill([], model.new_cache(64), chunk_size=4)
+    with pytest.raises(ValueError, match="chunk_size must be >= 1"):
+        model.prefill(IDS, model.new_cache(64), chunk_size=0)
+
+
+def test_prefill_rejects_an_offset_that_disagrees_with_the_cache(model: CausalLMModel):
+    cache = model.new_cache(64)
+    model.prefill(IDS[:3], cache, chunk_size=3)
+    with pytest.raises(ValueError, match="disagrees with kv_cache.length"):
+        model.prefill(IDS[3:], cache, chunk_size=3, position_offset=0)
+
+
+def test_an_overflowing_prefill_commits_only_the_chunks_that_fit(model: CausalLMModel):
+    """A chunked prefill cannot roll back, so the length must say what really ran.
+
+    Claiming ``length == 0`` here would be a lie in the other direction: two
+    chunks did complete a full forward and their K/V is in the slots.
+    """
+    cache = model.new_cache(8)
+    with pytest.raises(ContextOverflowError):
+        model.prefill(list(range(20)), cache, chunk_size=4)
+    assert cache.length == 8  # two chunks committed, the third was refused
+    assert cache.length <= cache.max_context
+
+    refused_first = model.new_cache(4)
+    with pytest.raises(ContextOverflowError):
+        model.prefill(list(range(20)), refused_first, chunk_size=8)
+    assert refused_first.length == 0
+
+
+# --------------------------------------------------------------------------- #
+# the decode step builds no causal mask
+# --------------------------------------------------------------------------- #
+
+
+def test_a_multi_token_block_builds_a_mask_and_a_single_token_one_does_not(
+    model: CausalLMModel, monkeypatch
+):
+    """Observed by counting the calls, not inferred from a timing."""
+    calls: list[tuple[int, int, int]] = []
+    original = model_module.causal_attention_mask
+
+    def counted(num_queries, num_keys, position_offset):
+        calls.append((num_queries, num_keys, position_offset))
+        return original(num_queries, num_keys, position_offset)
+
+    monkeypatch.setattr(model_module, "causal_attention_mask", counted)
+
+    cache = model.new_cache(32)
+    model.forward([4, 9, 2], cache)
+    assert calls == [(3, 3, 0)], "a three-token block still has a triangle"
+
+    calls.clear()
+    model.forward([7], cache)
+    assert calls == [], "a decode step built the all-zero mask anyway"
+
+    calls.clear()
+    model.prefill([1, 2, 3, 4, 5], model.new_cache(32), chunk_size=2)
+    # Chunks of 2 over five tokens: 2 + 2 + 1. Only the last is mask-free.
+    assert calls == [(2, 2, 0), (2, 4, 2)]
+
+
+def test_a_single_token_forward_is_unchanged_by_not_building_the_mask(
+    model: CausalLMModel, monkeypatch
+):
+    """Put the zero mask back and check nothing moves.
+
+    ``encode`` does not call ``causal_attention_mask`` at all for one token, so
+    the comparison has to be made one level down: hand ``group_query_attention``
+    the all-zero array it would have received, and require identical logits.
+    """
+    real = model_module.group_query_attention
+
+    def with_zero_mask(q, k, v, num_kv_heads, scaling, mask=None):
+        if mask is None:
+            mask = np.zeros((1, 1, q.shape[1], k.shape[1]), dtype=np.float32)
+        return real(q, k, v, num_kv_heads, scaling, mask)
+
+    plain = model.new_cache(32)
+    model.forward([4, 9, 2], plain)
+    plain_logits = model.forward([7], plain).logits
+
+    monkeypatch.setattr(model_module, "group_query_attention", with_zero_mask)
+    masked = model.new_cache(32)
+    model.forward([4, 9, 2], masked)
+    masked_logits = model.forward([7], masked).logits
+
+    np.testing.assert_array_equal(plain_logits, masked_logits)
+    for layer in range(model.config.num_hidden_layers):
+        np.testing.assert_array_equal(plain.keys[layer], masked.keys[layer])
+        np.testing.assert_array_equal(plain.values[layer], masked.values[layer])
 
 
 # --------------------------------------------------------------------------- #

@@ -107,6 +107,41 @@ prompt = vision.build_prompt("picture.png", "图里有哪些形状？")
 print(vision.generate_prompt(prompt, max_new_tokens=32).text)
 ```
 
+两处复用接口，都是**显式**的：不调用就还是原来那条每次都从头算的路径。
+
+```python
+# 多轮对话：每轮只 prefill 与上一轮不同的那段 token（纯文本）
+session = engine.session()
+history = [{"role": "user", "content": "什么是 KV cache？"}]
+first = session.generate(history, max_new_tokens=64)
+history += [{"role": "assistant", "content": first.text},
+            {"role": "user", "content": "那它占多少内存？"}]
+second = session.generate(history, max_new_tokens=64)
+print(second.metrics.reused_tokens, second.metrics.prefill_tokens)   # 复用的 / 这次真 prefill 的
+session.reset()                                  # 丢掉前缀，保留 cache 分配
+
+# 同一批文档问多次：先编码一次，之后每个 query 只编码自己
+index = embedder.index_documents(corpus)
+batch, ranking = index.search("第一个问题")
+batch, ranking = index.search("第二个问题")
+
+# 同一张图问多次：视觉塔只跑一次（VisionEngine 默认就带这个缓存）
+print(vision.image_features.stats())             # hits / misses / evictions / bytes
+vision = VisionEngine.from_directory(model_dir, image_cache_bytes=0)   # 关掉
+```
+
+**换掉 `vision.model` 时缓存会自己作废，不需要手动清。** 每次查缓存之前都比两样：
+模型**对象**本身，以及 `_vision_identity()` 的五元组（权重 manifest 指纹 +
+视觉配置 + 预处理配置 + `image_token_id` + `scale_factor`）。任一样变了就整表作废，
+下一次请求重算一次、之后重新命中。**同权重、不同配置也算换模型**——
+指纹描述的是 manifest，所以在同一份权重上改 `layer_norm_eps` 或 `image_mean`
+重建出来的模型指纹完全相同，只比指纹会把上一个模型的特征交给新模型。
+绑一个不能编码图片的对象（文本模型）会抛 `TypeError` 并点名支持的是
+`SmolVLMModel`，**不会**静默返回旧特征。这次检查实测 **0.0326–0.0331 ms**，
+只读 manifest、不读张量。
+
+`slowq chat` 默认走会话（`--no-reuse` 关掉），每轮打印复用了多少 token。
+
 流式输出与采样示例见 [examples/quickstart.py](examples/quickstart.py)。
 
 ## 范围与限制
@@ -114,7 +149,10 @@ print(vision.generate_prompt(prompt, max_new_tokens=32).text)
 - v0.2 为实验版：仅 CPU、FP32、batch size 1。
 - 面向代码阅读和推理实验；不提供量化、GPU 后端、并发服务、tool calling、训练与微调。
 - 图文生成一次请求只接受一张图，第二张会报错；一张图仍会按官方规则切成多个 crop。
-- 向量任务只提供向量输出与余弦相似度示例，没有向量库或 RAG 管道。
+- 向量任务只提供向量输出、余弦相似度与一个**进程内、不落盘**的预编码索引
+  （`index_documents`），没有持久化向量库、没有 ANN、没有 RAG 管道。
+- `Engine.session()` 只支持纯文本；图文请求会报错，因为缓存的前缀不记录自己来自哪张图。
+  会话自己分配一份满尺寸 KV cache，`max_context=2048` 的 Qwen3-0.6B 上约 448 MiB。
 - prompt 与预留生成长度之和超过 `max_context`、或文本超过 `max_length` 时会报错，不会自动截断。
 - Windows 和大端平台暂不支持。性能取决于 CPU、BLAS、线程数及上下文长度。
 - v0.2 的全部验证都在 macOS arm64 上执行；Linux x86_64 只有 v0.1 的 Qwen3-0.6B 记录。
@@ -125,7 +163,7 @@ print(vision.generate_prompt(prompt, max_new_tokens=32).text)
 
 ```bash
 python -m pip install -e ".[dev]"
-python -m pytest -m "not integration" -q     # 685 passed, 62 deselected
+python -m pytest -m "not integration" -q     # 1042 passed, 62 deselected
 ```
 
 真实权重的集成测试用 `SLOWQ_MODEL_DIR=<转换后的目录> python -m pytest -m integration -q`。
@@ -135,7 +173,9 @@ python -m pytest -m "not integration" -q     # 685 passed, 62 deselected
 - [测试与数值验证](docs/validation.md)：测试分层、参考验证协议、容差与实测结果。
 - [性能与内存](docs/benchmarks.md)：实测数据、测量条件与复现命令。
 - [变更记录](docs/changelog.md)：v0.2.0 与 v0.1.0。
-- [v0.2 多模型接入报告](docs/v0.2-多模型接入报告.md)：本轮的设计决策、踩坑记录与未完成项。
+- [v0.2 多模型接入报告](docs/v0.2-多模型接入报告.md)：那一轮的设计决策、踩坑记录与未完成项。
+- [推理加速第 1 轮实测](docs/推理加速-第1轮-2026-10-23.md)：本轮五项改动省掉了什么、
+  怎么验证正确性、A/B 实测数字与适用条件。
 
 ## 许可
 

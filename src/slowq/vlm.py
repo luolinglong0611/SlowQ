@@ -36,8 +36,12 @@ message naming the extra rather than a bare ``ModuleNotFoundError``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import time
+import weakref
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -102,6 +106,13 @@ SUPPORTED_RESAMPLE = (0, 1, 2, 3, 4, 5)
 #: different route through ``to_pil_image`` that SlowQ has not verified against
 #: the reference, so they are refused by name rather than guessed at.
 SUPPORTED_IMAGE_MODES = ("RGB", "RGBA")
+
+#: Default ceiling on the image-feature cache, in bytes. SmolVLM-256M's connector
+#: features for a 9-frame image are ``576 x 512`` FP32 — about 1.2 MiB — so this
+#: holds on the order of a hundred images, which is far more than "ask several
+#: questions about one picture" needs and far less than a process that quietly
+#: keeps every image it ever saw. Pass ``0`` to ``VisionEngine`` to turn it off.
+DEFAULT_IMAGE_CACHE_BYTES = 128 * 1024 * 1024
 
 
 def _pillow() -> Any:
@@ -1119,6 +1130,174 @@ class VisionPrompt:
     image_positions: tuple[int, ...]
 
 
+class ImageFeatureCache:
+    """Connector features for images this engine has already encoded.
+
+    Only ``VisionOutput.features`` is stored. A whole ``VisionOutput`` also
+    carries ``per_frame`` and ``encoder_output``, and ``encoder_output`` is at the
+    vision tower's own hidden size — for a 9-frame SmolVLM-256M image, roughly
+    28 MiB against the ~1.2 MiB of features the decoder actually consumes.
+    Caching the whole output would spend twenty times the memory to skip the same
+    forward. ``features`` is the right boundary because it is exactly what
+    :meth:`VisionEngine.stream_prompt` hands to the prefill, and everything
+    upstream of it is what the cache exists to avoid recomputing.
+
+    That boundary is also what keeps the debug and validation paths intact:
+    ``tools/validate_reference.py``, ``tests/test_vlm.py`` and
+    ``tests/test_integration_vlm.py`` read ``encoder_output`` and ``per_frame``
+    through ``VisionModel.encode`` / ``SmolVLMModel.encode_image``, and neither
+    method goes through here. Only ``stream_prompt`` does.
+
+    Bounded and least-recently-used. Ownership is explicit on both sides:
+    :meth:`put` copies the array in and :meth:`get` copies it back out, so a
+    caller that mutates the features it was handed cannot poison the entry, and
+    two requests never hold the same buffer. Measured on SmolVLM-256M, that copy
+    is 0.009 ms for 720 KiB and 0.016 ms for 1.3 MiB, against a vision tower
+    that takes about 2.3 s warm — five orders of magnitude, and the reason the
+    copies are not worth optimising away.
+    """
+
+    def __init__(self, max_bytes: int = DEFAULT_IMAGE_CACHE_BYTES) -> None:
+        if max_bytes < 0:
+            raise ValueError(f"max_bytes must be >= 0, got {max_bytes}")
+        #: ``0`` disables the cache: :meth:`put` stores nothing.
+        self.max_bytes = int(max_bytes)
+        self._entries: OrderedDict[Any, np.ndarray] = OrderedDict()
+        self._nbytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __contains__(self, key: Any) -> bool:
+        return key in self._entries
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes of features currently held, against :attr:`max_bytes`."""
+        return self._nbytes
+
+    def get(self, key: Any) -> np.ndarray | None:
+        """A private copy of the cached features, or ``None`` if absent.
+
+        Both outcomes are counted, so ``hits / (hits + misses)`` is the hit rate
+        over lookups rather than over whatever the caller chose to report.
+        """
+        entry = self._entries.get(key)
+        if entry is None:
+            self.misses += 1
+            return None
+        self._entries.move_to_end(key)
+        self.hits += 1
+        return np.array(entry, dtype=np.float32, copy=True)
+
+    def put(self, key: Any, features: np.ndarray) -> bool:
+        """Store a private copy of ``features``; return whether it was kept.
+
+        ``False`` means the cache is disabled, or that one image's features are
+        larger than the entire budget. The second case is skipped rather than
+        stored: keeping it would evict everything else and then not fit either,
+        so the only effect would be to thrash.
+        """
+        if self.max_bytes == 0:
+            return False
+        stored = np.array(features, dtype=np.float32, copy=True)
+        cost = int(stored.nbytes)
+        if cost > self.max_bytes:
+            return False
+        previous = self._entries.pop(key, None)
+        if previous is not None:
+            self._nbytes -= int(previous.nbytes)
+        self._entries[key] = stored
+        self._nbytes += cost
+        while self._nbytes > self.max_bytes and self._entries:
+            _, evicted = self._entries.popitem(last=False)
+            self._nbytes -= int(evicted.nbytes)
+            self.evictions += 1
+        return True
+
+    def clear(self) -> None:
+        """Drop every entry.
+
+        The counters deliberately survive: they describe this engine's history,
+        and a caller clearing the cache to free memory has not un-happened the
+        hits it already got.
+        """
+        self._entries.clear()
+        self._nbytes = 0
+
+    def stats(self) -> dict[str, Any]:
+        lookups = self.hits + self.misses
+        return {
+            "entries": len(self._entries),
+            "bytes": self._nbytes,
+            "max_bytes": self.max_bytes,
+            "hits": self.hits,
+            "misses": self.misses,
+            "evictions": self.evictions,
+            "hit_rate": (self.hits / lookups) if lookups else float("nan"),
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"<ImageFeatureCache entries={len(self._entries)} "
+            f"bytes={self._nbytes}/{self.max_bytes} hits={self.hits} "
+            f"misses={self.misses} evictions={self.evictions}>"
+        )
+
+
+def _vision_identity(model: Any) -> tuple[Any, ...]:
+    """Everything a cached connector feature depends on that is not the image.
+
+    The weight manifest's fingerprint plus the four parts of the checkpoint config
+    the vision path reads. All five are hashable and all five are cheap: the
+    fingerprint reads the manifest and never the tensors, and the config objects are
+    frozen dataclasses of scalars and float tuples, so comparing two of them is a
+    field walk rather than a computation.
+
+    ``vision`` and ``processor`` are here because the fingerprint is not enough on
+    its own, and the gap is not theoretical. ``Weights.fingerprint()`` describes the
+    *manifest* — which directory, which format, which tensor table — so two models
+    built over one ``Weights`` object with different configs have the *same*
+    fingerprint. Rebinding ``engine.model`` to such a model is legal, changes what
+    the tower computes (``layer_norm_eps``) or what the preprocessor produces
+    (``image_mean``), changes no shape and no row count, and so used to leave the
+    cache serving the previous model's features to a request that looked successful.
+
+    ``image_token_id`` and ``scale_factor`` are here for the same reason as ``vision``:
+    they are config the connector's output depends on and the manifest does not record.
+
+    The model *object* is deliberately not part of this tuple. Two engines over one
+    directory must agree on a key — see
+    ``test_two_engines_on_one_directory_agree_on_the_key`` — and an object component
+    would make every key engine-private. Object identity is tracked separately, in
+    :attr:`VisionEngine._identity_model`.
+
+    Raises ``TypeError`` for a model that cannot encode images at all. ``self.model``
+    is an ordinary attribute, so a caller can bind anything to it, and the
+    alternatives to refusing are both worse: an ``AttributeError`` from deep inside
+    the refresh names the missing field rather than the mistake, and keeping the old
+    config would serve features from a tower the new model does not have.
+    """
+    config = getattr(model, "vlm_config", None)
+    if config is None:
+        raise TypeError(
+            f"VisionEngine.model was set to a {type(model).__name__}, which has no "
+            "vlm_config and so cannot encode an image. Supported replacements are "
+            "SmolVLMModel instances; keeping the previous model's cached features "
+            "for a model with no vision tower is not one of them."
+        )
+    return (
+        model.weights.fingerprint(),
+        config.vision,
+        config.processor,
+        config.image_token_id,
+        config.scale_factor,
+    )
+
+
 class VisionEngine(Engine):
     """``Engine`` plus one image per request.
 
@@ -1128,6 +1307,15 @@ class VisionEngine(Engine):
     Decoding afterwards is the ordinary cached text loop, because
     ``Idefics3Model.forward`` only merges image features when
     ``past_seen_tokens == 0``.
+
+    "Once" is per image, not per request. :attr:`image_features` remembers the
+    connector output of images this engine has already encoded, so asking a
+    second question about the same picture skips the vision tower entirely — for
+    SmolVLM-256M that is the single largest cost of the request. The lookup is
+    keyed on a hash of the prepared pixels plus the crop geometry plus the model's
+    identity (:func:`_vision_identity`: the weight manifest and the vision,
+    preprocessing, token and shuffle config), so a hit means the same numbers
+    would have come out.
     """
 
     def __init__(
@@ -1138,6 +1326,7 @@ class VisionEngine(Engine):
         max_context: int = DEFAULT_MAX_CONTEXT,
         prefill_chunk_size: int = 128,
         load_seconds: float = float("nan"),
+        image_cache_bytes: int = DEFAULT_IMAGE_CACHE_BYTES,
     ) -> None:
         super().__init__(
             model=model,
@@ -1149,6 +1338,15 @@ class VisionEngine(Engine):
         )
         self.vlm_config = model.vlm_config
         self.preprocessor = ImagePreprocessor(model.vlm_config.processor)
+        self.image_features = ImageFeatureCache(image_cache_bytes)
+        #: The identity the feature cache's keys carry, and the object it was read
+        #: from. Both are re-read before every lookup by
+        #: :meth:`_model_identity_changed`, because ``self.model`` is an ordinary
+        #: attribute and a caller may rebind it. The reference is weak so that
+        #: rebinding ``self.model`` is enough to let the previous model go: a strong
+        #: one here would keep a whole checkpoint alive until the next request.
+        self._identity_model: weakref.ReferenceType[Any] | None = weakref.ref(model)
+        self._identity = _vision_identity(model)
 
     @property
     def image_token_id(self) -> int:
@@ -1161,6 +1359,7 @@ class VisionEngine(Engine):
         *,
         max_context: int = DEFAULT_MAX_CONTEXT,
         prefill_chunk_size: int = 128,
+        image_cache_bytes: int = DEFAULT_IMAGE_CACHE_BYTES,
     ) -> "VisionEngine":
         """Load a converted ``idefics3`` directory. Fully offline."""
         with stopwatch() as elapsed:
@@ -1177,6 +1376,7 @@ class VisionEngine(Engine):
             max_context=max_context,
             prefill_chunk_size=prefill_chunk_size,
             load_seconds=elapsed[0],
+            image_cache_bytes=image_cache_bytes,
         )
 
     # ---- prompt construction ------------------------------------------------
@@ -1195,7 +1395,12 @@ class VisionEngine(Engine):
         content parts, because SmolVLM's template indexes
         ``message['content'][0]['type']`` — a plain-string message would raise
         inside Jinja rather than produce a prompt.
+
+        The model's identity is re-read first, so preprocessing follows the model
+        this request will actually be decoded by. See
+        :meth:`_model_identity_changed`.
         """
+        self._model_identity_changed()
         prepared = self.preprocessor.prepare(image)
 
         messages: list[dict[str, Any]] = []
@@ -1313,10 +1518,13 @@ class VisionEngine(Engine):
         its own validation would not happen until the first ``next()`` — long
         after the vision tower had run over every crop. Refusing here costs
         nothing and makes an illegal image+text request as cheap to reject as a
-        text one.
+        text one. The same ordering keeps a refused request out of the feature
+        cache: nothing is looked up, and nothing is stored.
         """
         self._validate_request(prompt.token_ids, max_new_tokens)
-        features = self.model.encode_image(prompt.image)
+        features, encode_seconds, cache_hit = self._vision_features(
+            prompt.image, probe=probe
+        )
         mask = np.zeros(len(prompt.token_ids), dtype=bool)
         mask[list(prompt.image_positions)] = True
         return self.stream_ids(
@@ -1324,9 +1532,256 @@ class VisionEngine(Engine):
             sampling=sampling,
             max_new_tokens=max_new_tokens,
             probe=probe,
-            prefill_embeds=(features.features, mask),
-            vision_encode_seconds=features.encode_seconds,
+            prefill_embeds=(features, mask),
+            vision_encode_seconds=encode_seconds,
+            vision_cache_hit=cache_hit,
         )
+
+    # ---- image feature reuse ------------------------------------------------
+
+    def _model_identity_changed(self) -> bool:
+        """Re-read the model's identity; drop derived state if it moved.
+
+        ``self.model`` is an ordinary attribute, so a caller can point a live
+        engine at a different model. Everything derived from the old one then
+        describes numbers this engine no longer computes, and the feature cache is
+        the dangerous case: its keys carry an identity snapshotted in ``__init__``,
+        so a swapped model keeps producing the *old* key, hits the *old* entry, and
+        hands the new decoder the previous model's image features. Nothing raises —
+        the shape and the row count still line up — so the request completes and is
+        confidently wrong.
+
+        Two things are compared, and both are needed:
+
+        * the model *object*, by identity. A weak reference rather than ``id()``,
+          because ids are recycled once an object is collected and a recycled id
+          compares equal to the model it replaced; ``is`` cannot be fooled that
+          way, and a dead referent returns ``None``, which is simply not the
+          current model. A rebind to an object that computes the same numbers
+          costs one recompute — the cache cannot distinguish "equivalent" from
+          "changed in a way no config field records", and it does not try;
+        * the *value* identity, :func:`_vision_identity`: the weight manifest's
+          fingerprint plus the vision, preprocessing, token-id and shuffle config.
+
+        The second is what the first cannot cover. ``Weights.fingerprint()``
+        describes the manifest — the directory, the format, the tensor table — so
+        two models built over one ``Weights`` object with different configs share a
+        fingerprint exactly. That was the surviving hole after the weights-swap fix:
+        ``dataclasses.replace`` a legal compute parameter such as
+        ``vision.layer_norm_eps``, rebuild the model over the same weights, rebind
+        it, and the old entry was served for a tower that no longer computes it.
+
+        Running this before every cache lookup is affordable because nothing in it
+        reads a tensor. :meth:`Weights.fingerprint` reads the manifest only; that is
+        measured, not estimated: ``tools/perf/identity_cost.py``, nine independent
+        processes over SmolVLM-256M's 471-entry manifest, in
+        ``artifacts/perf-round1-rerun/identity/``,
+        ``artifacts/probe-rerun-20261028/identity/`` and
+        ``artifacts/probe-rerun-20261029/identity/``, read a **0.0281-0.0304 ms**
+        median. The spread *within* one run of 200 calls (0.0276-0.0524 ms) is
+        an order of magnitude wider than the movement *between* runs, so the
+        medians are quotable as a band and the individual calls are not.
+        Qwen3-1.7B's 310-entry, 6.4 GiB manifest reads **0.0224-0.0240 ms** —
+        cheaper than the smaller model's, because the cost tracks the entry count
+        and not the byte count. That is the property making this affordable on a
+        large model.
+
+        The whole check — that call, building the config tuple, one weak-reference
+        dereference and one comparison — reads **0.0306-0.0331 ms**, i.e.
+        **1.07-1.09x** the bare fingerprint it wraps. So covering the config as
+        well as the manifest added under a tenth to a call that was already three
+        hundredths of a millisecond. That is measured rather than argued because an
+        unmeasured widening is one nobody can object to, which is how a per-request
+        cost grows until it matters. The probe times the three layers separately —
+        ``fingerprint`` inside ``identity_tuple`` inside ``identity_check`` — so the
+        cost of the config comparison is not hiding inside a total.
+
+        Against it, the same lookup spends **15.41-16.62 ms** hashing a 5-frame
+        image's pixels and **27.73-29.65 ms** on a 9-frame one, i.e. **530-995x**
+        a bare ``fingerprint()`` call. End to end, a cache **hit** costs
+        **15.71-16.58 ms** for the 5-frame image and **28.92-30.38 ms** for the
+        9-frame one: the identity check is **0.11%-0.20%** of that, and the hit is
+        **0.68%-0.73%** of the miss it replaces. The alternative — hashing the
+        weights, which is what would actually detect a content change — measured
+        **0.40-1.62 s** on SmolVLM-256M depending on whether the mmap pages were
+        already resident, which is **15.4%-60.3% of the very encode this cache
+        exists to skip**, and **7.91-8.49 s** on Qwen3-1.7B. The width of that
+        share is the two quantities being in *different* cache states inside one
+        run — ``artifacts/probe-rerun-20261029/identity/`` runs 2 and 3 encode a
+        warm 2.58-2.72 s and then hash a cold 1.55-1.60 s, because that host was
+        swapping 738 MiB against the 674 MiB the previous root recorded. Paying that per
+        request to protect one forward is self-defeating, so the identity checks
+        the manifest and the config and accepts the consequence documented on
+        :meth:`Weights.fingerprint`.
+
+        Turning the cache off is not the free alternative either. With
+        ``image_cache_bytes=0`` neither the identity check nor the pixel hash runs,
+        and the same 5-frame image costs **2.25-2.40 s** per request instead of
+        **15.71-16.58 ms**. A miss costs **2.29-2.39 s**, which is **0.98-1.02x**
+        the disabled path — straddling 1.0, so at five samples per path the
+        identity check, the pixel hash and the copy in are not distinguishable from
+        the forward they accompany rather than being provably free. All three paths
+        return bit-identical features in every run (``bit_identical`` in the
+        artifact, checked with ``np.array_equal`` against a direct ``encode_image``
+        and not against a tolerance), and ``changed_count`` is 0 over 200 calls,
+        which is what makes those timings describe a cache that hits.
+
+        Reproduce with::
+
+            RUN=$(.venv/bin/python tools/perf/out_guard.py fresh-root)
+            .venv/bin/python tools/perf/identity_cost.py \
+                --model models/SmolVLM-256M-Instruct-slowq \
+                --image artifacts/validation/SmolVLM-256M-Instruct-slowq/vision-grid-1x4.png \
+                --image artifacts/validation/SmolVLM-256M-Instruct-slowq/vision-grid-2x4.png \
+                --calls 200 --path-calls 5 --out "$RUN/identity/run.json"
+
+        One process per run, nothing else resident, and a fresh ``--out`` each time:
+        the probe refuses to overwrite, so a second attempt is a second artifact
+        beside the first rather than a replacement for it.
+
+        Clearing rather than refusing is a choice this cache can make and
+        :class:`~slowq.embedding.DocumentIndex` cannot. That index holds work its
+        *caller* paid for — a full prefill per document — so it raises and asks
+        for a new one instead of rebuilding behind their back. Connector features
+        are this engine's own scratch space, and recomputing one image is exactly
+        what a cache miss already costs. The counters survive the clear, because
+        they describe the engine's history rather than its current contents.
+
+        ``vlm_config`` and ``preprocessor`` move with the identity, so an engine is
+        never left decoding with a new model while cropping images to the old one's
+        settings. :meth:`build_prompt` calls this *before* it preprocesses, which is
+        what keeps the two in step for a request arriving through
+        :meth:`stream_image` — reversing that order would leave a one-request window
+        in which the first image after a swap is cropped by the previous model. A
+        caller that hands :meth:`stream_prompt` a prompt built before the swap keeps
+        that prompt's geometry; the key's crop fields make it a distinct entry
+        rather than a wrong hit.
+
+        A model with no ``vlm_config`` is not a supported replacement and
+        :func:`_vision_identity` refuses it by name. Raising is the honest answer
+        there: the cache has nothing to derive from a model that has no vision
+        tower, and the alternative is serving the previous model's features.
+        """
+        model = self.model
+        identity = _vision_identity(model)
+        if (
+            self._identity_model is not None
+            and self._identity_model() is model
+            and identity == self._identity
+        ):
+            return False
+        self._identity_model = weakref.ref(model)
+        self._identity = identity
+        self.image_features.clear()
+        self.vlm_config = model.vlm_config
+        self.preprocessor = ImagePreprocessor(self.vlm_config.processor)
+        return True
+
+    def _image_cache_key(self, prepared: PreparedImage) -> tuple[Any, ...]:
+        """Everything the connector output depends on, as one hashable tuple.
+
+        Three things, because a hit has to mean "the same numbers would have come
+        out":
+
+        * the image content — a digest of the prepared pixels and their attention
+          mask, not of the file it came from. Two different files that preprocess
+          to identical pixels legitimately share features, and the same file
+          preprocessed differently does not;
+        * the geometry the prompt was built from — crop grid and sizes, which are
+          what decide how many ``<image>`` tokens the features have to fill;
+        * the model — :attr:`_identity`: the weight manifest's fingerprint plus the
+          vision config, the preprocessing config, ``image_token_id`` and
+          ``scale_factor``. Both frozen configs are dataclasses of scalars and float
+          tuples, so they hash as themselves and any changed resize, normalisation,
+          ``image_seq_len`` or ``layer_norm_eps`` invalidates.
+
+          The fingerprint alone is not enough, and that was a real hole rather than
+          belt-and-braces: it describes the *manifest*, so two models built over one
+          ``Weights`` object with different configs share one exactly, and a
+          ``dataclasses.replace`` of a legal compute parameter would then key to the
+          previous tower's output. Carrying it as one tuple element rather than five
+          keeps "the model" a single thing to reason about, and means widening
+          :func:`_vision_identity` widens the key with it instead of needing a
+          second edit here that is easy to forget.
+
+        Hashing the pixels costs real time, and it is measured rather than
+        estimated: on SmolVLM-256M with the two validation images,
+        **15.41-16.62 ms** for a 5-frame one and **27.73-29.65 ms** for a
+        9-frame one, nine independent processes agreeing to within 8%
+        (``artifacts/perf-round1-rerun/identity/``,
+        ``artifacts/probe-rerun-20261028/identity/`` and
+        ``artifacts/probe-rerun-20261029/identity/``, from
+        ``tools/perf/identity_cost.py``). That is **0.39%-1.21%** of the vision
+        encode they stand in for — and the width of that range is the page cache,
+        not the hashing. The key itself runs at 1.47-1.58 GiB/s in every run;
+        what moves is the encode it is a fraction of, 2.43-4.09 s depending on
+        whether the weights are already resident.
+
+        Both figures price the two arrays *together*. This docstring earlier
+        quoted 15.0 and 27.0 MiB at "roughly 1 GB/s", which counted only
+        ``pixel_values``: the attention mask is int64 and is exactly 40% of the
+        bytes hashed, so **25.0 and 45.0 MiB** are the honest amounts. The trade
+        is right either way, and it is charged to ``vision_encode_seconds`` below
+        rather than hidden. The arrays go through ``ascontiguousarray`` because
+        ``blake2b`` refuses a strided buffer outright.
+        """
+        values = np.ascontiguousarray(
+            np.asarray(prepared.pixel_values, dtype=np.float32)
+        )
+        mask = np.ascontiguousarray(np.asarray(prepared.pixel_attention_mask))
+        return (
+            hashlib.blake2b(values, digest_size=16).hexdigest(),
+            values.shape,
+            hashlib.blake2b(mask, digest_size=16).hexdigest(),
+            mask.shape,
+            prepared.rows,
+            prepared.cols,
+            prepared.image_seq_len,
+            prepared.original_size,
+            prepared.resized_size,
+            prepared.encoder_size,
+            self._identity,
+        )
+
+    def _vision_features(
+        self, prepared: PreparedImage, *, probe: DebugProbe | None
+    ) -> tuple[np.ndarray, float, bool]:
+        """Connector features for one image, plus how long *this* request spent.
+
+        Returns ``(features, seconds, cache_hit)``. The seconds are this request's
+        own: the vision tower plus the pixel hash on a miss, the pixel hash and
+        the identity check alone on a hit. It is never the duration of the earlier
+        request that did the work, because reporting that would credit this one
+        with an encode it skipped and hide the speedup the cache exists to
+        produce.
+
+        A ``probe`` bypasses the cache in both directions: it neither reads a
+        stored entry nor writes one. Every name in ``DebugProbe.ALL_CAPTURES`` is
+        decoder-side, so a cached hit would still fill them — but a probe means
+        "show me what this request computed", and serving features produced by an
+        earlier one answers a subtly different question. Debug runs are not
+        performance runs, so the bypass costs nothing that matters. It skips the
+        identity check for the same reason: with nothing looked up and nothing
+        stored, there is no stale entry to be served, and the encode below goes to
+        whatever ``self.model`` is right now.
+
+        On a miss the request keeps the array the tower returned and the cache
+        stores a copy of it, so the two never alias: a caller that writes into
+        the features it was handed cannot change what the next request receives.
+        """
+        if probe is not None or self.image_features.max_bytes == 0:
+            output = self.model.encode_image(prepared)
+            return output.features, output.encode_seconds, False
+
+        started = time.perf_counter()
+        self._model_identity_changed()
+        key = self._image_cache_key(prepared)
+        cached = self.image_features.get(key)
+        if cached is not None:
+            return cached, time.perf_counter() - started, True
+        output = self.model.encode_image(prepared)
+        self.image_features.put(key, output.features)
+        return output.features, time.perf_counter() - started, False
 
     def describe(self) -> list[tuple[str, Any]]:
         return self.vlm_config.describe()

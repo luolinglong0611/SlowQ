@@ -143,6 +143,103 @@ def test_npy_file_bytes_exceed_the_logical_size_because_of_headers(model_dir: Pa
 
 
 # --------------------------------------------------------------------------- #
+# fingerprint: the identity a derived-value cache is keyed on
+# --------------------------------------------------------------------------- #
+
+
+def test_the_fingerprint_names_the_directory_and_every_manifest_field(model_dir: Path):
+    """It is the manifest, read out in a fixed order — nothing inferred."""
+    weights = Weights.from_directory(model_dir)
+    manifest = read_manifest(model_dir)
+    root, format_version, family, task, dtype, revision, tensors = weights.fingerprint()
+
+    assert root == str(model_dir.resolve())
+    assert format_version == manifest["format_version"]
+    # ``.get`` because this fixture is a version-1 directory, which records
+    # neither field: the fingerprint has to carry that absence rather than
+    # inventing a default, or two different conversions could collide on it.
+    assert manifest.get("model_family") is None and family is None
+    assert manifest.get("task") is None and task is None
+    assert dtype == manifest["compute_dtype"]
+    assert revision == manifest["source"]["revision"]
+    assert {name for name, _, _ in tensors} == set(weights.tensor_names)
+    for name, shape, spec_dtype in tensors:
+        spec = weights.manifest.tensors[name]
+        assert shape == tuple(spec.shape) and spec_dtype == spec.dtype
+
+
+def test_the_fingerprint_is_hashable_and_stable_for_one_directory(model_dir: Path):
+    """Two loads of one directory have to agree, or no cache would ever hit."""
+    first = Weights.from_directory(model_dir).fingerprint()
+    second = Weights.from_directory(model_dir).fingerprint()
+    assert first == second
+    assert hash(first) == hash(second)
+    assert {first: "value"}[second] == "value"
+
+
+def test_the_fingerprint_separates_two_directories(tmp_path: Path, write_model):
+    """Both the location and the tensor table take part in the identity."""
+    left = Weights.from_directory(write_model(tmp_path / "left", vocab_size=VOCAB))
+    same = Weights.from_directory(write_model(tmp_path / "same", vocab_size=VOCAB))
+    other = Weights.from_directory(write_model(tmp_path / "other", vocab_size=VOCAB + 1))
+
+    assert left.fingerprint() != same.fingerprint(), "the path has to matter"
+    assert left.fingerprint() != other.fingerprint(), "the tensor table has to matter"
+    assert left.fingerprint()[1:] != other.fingerprint()[1:], (
+        "a different vocabulary changes the shapes, not just the directory"
+    )
+
+
+def test_the_fingerprint_changes_when_the_manifest_does(model_dir: Path):
+    """A re-converted checkpoint must not be mistaken for the one already cached.
+
+    Every variant here is one the parser accepts: ``compute_dtype`` is not among
+    them, because ``_parse_manifest`` refuses anything but ``float32`` before a
+    fingerprint could ever be taken.
+    """
+    before = Weights.from_directory(model_dir).fingerprint()
+    manifest = read_manifest(model_dir)
+    #: The same directory rewritten as a version-2 manifest, which has to carry
+    #: both keys or the load is refused.
+    upgraded = {"format_version": 2, "task": "text-generation", "model_family": "qwen3"}
+
+    for change in (
+        {"source": {**manifest["source"], "revision": "another-revision"}},
+        upgraded,
+        {**upgraded, "model_family": "qwen2"},
+        {**upgraded, "task": "text-embedding"},
+    ):
+        write_manifest(model_dir, {**manifest, **change})
+        assert Weights.from_directory(model_dir).fingerprint() != before, change
+
+    write_manifest(model_dir, manifest)
+    assert Weights.from_directory(model_dir).fingerprint() == before, (
+        "the fingerprint has to come from the manifest's contents, not the load"
+    )
+
+
+def test_the_fingerprint_reads_no_tensor(model_dir: Path, monkeypatch):
+    """Cheap on purpose: it keys caches that exist to skip work more expensive than it.
+
+    Hashing 500 MiB of FP32 to decide whether to run one forward would cost more
+    than the forward. The trade is that overwriting the ``.npy`` files under an
+    already-loaded engine leaves the fingerprint alone — and leaves that engine's
+    mmap alone too, so a cached value still matches what it would compute.
+    """
+    weights = Weights.from_directory(model_dir)
+    opened: list[str] = []
+    real_get = Weights.get
+
+    def watched(self, name):
+        opened.append(name)
+        return real_get(self, name)
+
+    monkeypatch.setattr(Weights, "get", watched)
+    assert weights.fingerprint() is not None
+    assert opened == [], "the fingerprint must not touch the arrays"
+
+
+# --------------------------------------------------------------------------- #
 # failures
 # --------------------------------------------------------------------------- #
 

@@ -1,13 +1,16 @@
 """Generation: chunked prefill, decode loop, stop conditions, streaming.
 
-Layering: ``stream_ids`` is the only place that runs the loop. Every other entry
-point (``generate``, ``generate_text``, ``stream``) resolves text into token IDs
-and delegates, so there is exactly one implementation of "prefill, then decode
-one token at a time".
+Layering: ``Engine._stream`` is the only place that runs the loop. Every other
+entry point (``generate``, ``generate_text``, ``stream``, ``stream_ids`` and all
+of ``Session``) resolves text into token IDs, picks a cache and a starting
+position, and delegates, so there is exactly one implementation of "prefill, then
+decode one token at a time".
 
 The KV cache is owned by the engine and reset at the *start* of each request,
 never at the end. A request that raises part-way through therefore cannot poison
-the next one.
+the next one. A :class:`Session` opts out of that reset on purpose — it is the
+one way to keep KV across requests — and pays for it with a second cache and an
+explicit prefix match.
 
 Timers cover model work only: ``decode_seconds`` accumulates forward + sample
 time per step, so time a consumer spends printing between yields is not counted
@@ -300,10 +303,11 @@ class Engine:
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
         tokenize_seconds: float = 0.0,
         vision_encode_seconds: float = 0.0,
+        vision_cache_hit: bool = False,
         probe: DebugProbe | None = None,
         prefill_embeds: tuple[np.ndarray, np.ndarray] | None = None,
     ) -> Iterator[GenerationStep]:
-        """The one real generation loop: chunked prefill, then token by token.
+        """The public generation entry point: chunked prefill, then token by token.
 
         ``prefill_embeds`` is ``(features, mask)``: rows that replace the embedded
         prompt tokens the boolean mask selects. Only ``slowq.vlm`` produces them —
@@ -311,25 +315,86 @@ class Engine:
         rather than engine state so that a request cannot leak image features into
         the next one. ``vision_encode_seconds`` travels the same way: it belongs to
         time-to-first-token, and without it the vision path would report a TTFT
-        that silently omits its largest cost.
+        that silently omits its largest cost. ``vision_cache_hit`` travels with it
+        because a near-zero encode is ambiguous on its own — it could mean the
+        image was tiny or that the tower never ran.
+
+        Always starts from an empty cache, so two requests through an engine can
+        never observe each other. Use :meth:`session` when that isolation is the
+        wrong trade — a chat re-renders its whole history every turn.
         """
         ids = self._validate_request(prompt_ids, max_new_tokens)
+        # Reset before use so an aborted previous request cannot be observed.
+        self._cache.reset()
+        yield from self._stream(
+            ids,
+            cache=self._cache,
+            prefill_from=0,
+            sampling=sampling,
+            max_new_tokens=max_new_tokens,
+            tokenize_seconds=tokenize_seconds,
+            vision_encode_seconds=vision_encode_seconds,
+            vision_cache_hit=vision_cache_hit,
+            probe=probe,
+            prefill_embeds=prefill_embeds,
+        )
+
+    def _stream(
+        self,
+        ids: list[int],
+        *,
+        cache: KVCache,
+        prefill_from: int,
+        sampling: SamplingParams | None,
+        max_new_tokens: int,
+        tokenize_seconds: float,
+        vision_encode_seconds: float,
+        probe: DebugProbe | None,
+        prefill_embeds: tuple[np.ndarray, np.ndarray] | None,
+        vision_cache_hit: bool = False,
+        reused_tokens: int = 0,
+        committed: list[int] | None = None,
+    ) -> Iterator[GenerationStep]:
+        """The one real loop, over a cache and a starting position the caller chose.
+
+        ``stream_ids`` passes this engine's freshly reset cache with
+        ``prefill_from=0``; :class:`Session` passes its own cache with the length of
+        the prefix it recognised. Keeping both on this one function is what stops
+        "prefill, then decode" from existing twice and drifting apart.
+
+        Contract for callers:
+
+        * ``ids`` has been through :meth:`_validate_request`.
+        * ``cache.length == prefill_from``. Not re-checked here — ``prefill_from``
+          is handed to ``DecoderModel.prefill`` as ``position_offset``, and
+          ``encode`` already refuses an offset that disagrees with the cache,
+          which is what keeps reused tokens on the right absolute positions.
+        * ``committed``, when given, is the caller's record of which token ids the
+          cache's committed slots hold. It is extended at exactly the points the
+          cache is, so a request abandoned or failed mid-decode leaves it
+          truthful rather than optimistically complete.
+        """
+        if prefill_from and prefill_embeds is not None:
+            raise ValueError(
+                "a request that reuses cached KV cannot also substitute image "
+                "features: the reused prefix was embedded from the token table, "
+                "and nothing here can confirm the cached slots still describe the "
+                "same image. Sessions are text-only."
+            )
 
         sampler = Sampler(sampling or SamplingParams())
         metrics = GenerationMetrics(
             tokenize_seconds=tokenize_seconds,
             vision_encode_seconds=vision_encode_seconds,
+            vision_cache_hit=vision_cache_hit,
             prompt_tokens=len(ids),
+            reused_tokens=reused_tokens,
             weight_logical_bytes=self.model.weights.deduplicated_bytes(),
-            kv_allocated_bytes=self._cache.allocated_bytes(),
+            kv_allocated_bytes=cache.allocated_bytes(),
         )
         decoder = self.tokenizer.incremental_decoder()
-
-        # Reset before use so an aborted previous request cannot be observed.
-        self._cache.reset()
         request_start = time.perf_counter()
 
-        forward = None
         embeds, embed_mask = (None, None) if prefill_embeds is None else prefill_embeds
         if embed_mask is not None:
             embed_mask = np.asarray(embed_mask, dtype=bool).reshape(-1)
@@ -344,30 +409,20 @@ class Engine:
                     "feature rows to put there"
                 )
         with stopwatch() as prefill_elapsed:
-            feature_cursor = 0
-            for start in range(0, len(ids), self.prefill_chunk_size):
-                chunk = ids[start : start + self.prefill_chunk_size]
-                chunk_embeds = chunk_mask = None
-                if embed_mask is not None:
-                    # Placeholder tokens can straddle a chunk boundary, so each
-                    # chunk takes its own slice of the feature rows in prompt
-                    # order rather than assuming the image fits in one chunk.
-                    chunk_mask = embed_mask[start : start + len(chunk)]
-                    take = int(chunk_mask.sum())
-                    if take:
-                        chunk_embeds = embeds[feature_cursor : feature_cursor + take]
-                    feature_cursor += take
-                forward = self.model.forward(
-                    chunk,
-                    self._cache,
-                    probe=probe,
-                    inputs_embeds=chunk_embeds,
-                    inputs_embed_mask=chunk_mask,
-                )
-                metrics.prefill_chunks += 1
+            prefill = self.model.prefill(
+                ids[prefill_from:],
+                cache,
+                chunk_size=self.prefill_chunk_size,
+                probe=probe,
+                position_offset=prefill_from,
+                inputs_embeds=embeds,
+                inputs_embed_mask=embed_mask,
+            )
         metrics.prefill_seconds = prefill_elapsed[0]
-        assert forward is not None  # the loop above always runs at least once
-        logits = forward.logits
+        metrics.prefill_chunks = prefill.chunks
+        logits = prefill.logits
+        if committed is not None:
+            committed.extend(ids[prefill_from:])
 
         generated: list[int] = []
         text_parts: list[str] = []
@@ -386,7 +441,13 @@ class Engine:
                 first_token = False
             else:
                 with stopwatch() as step_elapsed:
-                    logits = self.model.forward([token_id], self._cache, probe=probe).logits
+                    logits = self.model.forward([token_id], cache, probe=probe).logits
+                    # Recorded before sampling, and with no yield in between: a
+                    # sampler that raises, or a consumer that abandons the
+                    # generator at the yield below, both leave ``committed``
+                    # describing exactly the slots the cache holds.
+                    if committed is not None:
+                        committed.append(token_id)
                     token_id = sampler.sample(logits)
                 metrics.decode_seconds += step_elapsed[0]
 
@@ -439,6 +500,16 @@ class Engine:
                 result=None,
             )
 
+    # ---- sessions -----------------------------------------------------------
+
+    def session(self) -> "Session":
+        """A multi-turn conversation that reuses its KV cache across requests.
+
+        Allocates a *second* full-size cache rather than lending this engine's
+        one; :class:`Session` explains why that has to be so, and what it costs.
+        """
+        return Session(self)
+
     # ---- internals ----------------------------------------------------------
 
     def _prepare(
@@ -467,3 +538,340 @@ class Engine:
         if result is None:
             raise AssertionError("generation loop ended without a result")
         return result
+
+
+def common_prefix_length(left: Sequence[int], right: Sequence[int]) -> int:
+    """Length of the longest run of token ids two sequences share from the start.
+
+    Compared as ids, not as decoded text. A session decides what to reuse from the
+    tokens it is about to feed the model, so a template that re-tokenises the same
+    words into different ids — which BPE does at every turn boundary, because
+    ``"hello"`` and ``"hello</s></tool_response>"`` are not the same merge — yields a shorter
+    prefix instead of a wrong one. Under-reusing costs prefill time; over-reusing
+    would condition the model on a conversation it was never shown.
+    """
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
+
+
+@dataclass(frozen=True)
+class SessionReuse:
+    """What one session request found in the cache, before it ran.
+
+    Recorded at planning time rather than at completion, so a request that was
+    cancelled or that raised still reports the decision it made — which is the
+    part worth looking at when reuse stops happening.
+    """
+
+    prompt_tokens: int
+    reused_tokens: int
+    prefilled_tokens: int
+    discarded_tokens: int
+    cache_length_before: int
+
+    @property
+    def reuse_ratio(self) -> float:
+        return self.reused_tokens / self.prompt_tokens if self.prompt_tokens else 0.0
+
+    def describe(self) -> str:
+        return (
+            f"reused {self.reused_tokens}/{self.prompt_tokens} prompt tokens "
+            f"({self.reuse_ratio * 100:.0f}%), prefilled {self.prefilled_tokens}, "
+            f"discarded {self.discarded_tokens}"
+        )
+
+
+class Session:
+    """A multi-turn text conversation that reuses one KV cache across requests.
+
+    Why this is not the default
+    ---------------------------
+    ``Engine.stream_ids`` resets the cache at the start of every request, so two
+    requests through an engine can never observe each other. A chat does the
+    opposite: it re-renders the whole history on every turn, so turn *n*'s prompt
+    begins with turn *n-1*'s prompt plus the reply the model just wrote. That is
+    work the cache already did. A session keeps the cache alive between turns and
+    prefills only the part it does not recognise, which on a growing conversation
+    turns an O(n²) prefill into an O(n) one.
+
+    How the reuse boundary is chosen
+    --------------------------------
+    Each request renders and tokenises the *complete* history, then
+    :func:`common_prefix_length` compares those ids against the ids the cache was
+    actually built from. The match length is the reuse boundary. Nothing assumes
+    the new prompt extends the old one, so editing or deleting an earlier message
+    simply moves the boundary back; the cache is truncated to it and the rest is
+    recomputed. A full match still runs one token, because generation samples from
+    the last position's *logits* and the cache only holds its K/V.
+
+    Cost
+    ----
+    A session allocates its **own** full-size cache. Sharing the engine's would
+    mean any plain ``engine.generate()`` in between wiped the conversation, so the
+    two are separate buffers: at ``max_context=2048`` on Qwen3-0.6B that is
+    another ~448 MiB. ``reset()`` clears the prefix but keeps the allocation.
+
+    Scope
+    -----
+    Text only. An image-text request replaces embedded prompt rows with features
+    the vision tower produced, and a cached prefix carries no record of which
+    image it came from, so ``VisionEngine`` keeps its own path and ``_stream``
+    refuses the combination outright.
+    """
+
+    def __init__(self, engine: Engine) -> None:
+        self._engine = engine
+        self._model = engine.model
+        self._identity = self._geometry(engine)
+        self._cache: KVCache = engine.model.new_cache(engine.max_context)
+        # Token ids the cache's committed slots hold, positionally. Kept in step
+        # with ``cache.length`` by ``_stream`` at the points the cache advances,
+        # so it stays truthful through a cancelled or failed request.
+        self._committed: list[int] = []
+        self._turns = 0
+        self._last_reuse: SessionReuse | None = None
+
+    @staticmethod
+    def _geometry(engine: Engine) -> tuple[int, ...]:
+        config = engine.model.config
+        return (
+            config.num_hidden_layers,
+            config.num_key_value_heads,
+            config.head_dim,
+            config.vocab_size,
+            engine.max_context,
+        )
+
+    # ---- state --------------------------------------------------------------
+
+    @property
+    def engine(self) -> Engine:
+        return self._engine
+
+    @property
+    def cache(self) -> KVCache:
+        """This session's own cache — not the engine's."""
+        return self._cache
+
+    @property
+    def cached_tokens(self) -> int:
+        """Committed tokens currently reusable by the next request."""
+        return self._cache.length
+
+    @property
+    def turns(self) -> int:
+        """Requests whose final step reached the caller. A cancelled one is not a turn.
+
+        Counted at delivery rather than at generator exhaustion, so a caller that
+        stops reading once it has the result is still credited with the turn it
+        completed. See :meth:`_run`.
+        """
+        return self._turns
+
+    @property
+    def last_reuse(self) -> SessionReuse | None:
+        """The most recent request's reuse decision, or ``None`` before the first."""
+        return self._last_reuse
+
+    def reset(self) -> None:
+        """Forget the conversation; keep the buffers.
+
+        This is ``/clear``, not destruction: the next request starts from an empty
+        cache but does not pay for another allocation.
+        """
+        self._cache.reset()
+        self._committed.clear()
+        self._turns = 0
+        self._last_reuse = None
+
+    # ---- requests -----------------------------------------------------------
+
+    def stream(
+        self,
+        messages: Iterable[Mapping[str, Any] | ChatMessage] | None = None,
+        *,
+        prompt: str | None = None,
+        sampling: SamplingParams | None = None,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    ) -> Iterator[GenerationStep]:
+        """Streaming generation over a whole conversation, reusing what matches."""
+        ids, tokenize_seconds = self._engine._prepare(messages, prompt)
+        return self._run(
+            ids,
+            tokenize_seconds=tokenize_seconds,
+            sampling=sampling,
+            max_new_tokens=max_new_tokens,
+            probe=None,
+        )
+
+    def generate(
+        self,
+        messages: Iterable[Mapping[str, Any] | ChatMessage] | None = None,
+        *,
+        prompt: str | None = None,
+        sampling: SamplingParams | None = None,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    ) -> GenerationResult:
+        return Engine._drain(
+            self.stream(
+                messages, prompt=prompt, sampling=sampling, max_new_tokens=max_new_tokens
+            )
+        )
+
+    def stream_ids(
+        self,
+        prompt_ids: Sequence[int],
+        *,
+        sampling: SamplingParams | None = None,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        probe: DebugProbe | None = None,
+    ) -> Iterator[GenerationStep]:
+        """Token ids in, no chat template. ``probe`` positions are block-relative.
+
+        A caller that mixes this with :meth:`stream` gets reuse against whatever
+        ids were actually committed, which is the point of comparing ids: there is
+        no separate notion of "the conversation" to fall out of sync.
+        """
+        return self._run(
+            list(prompt_ids),
+            tokenize_seconds=0.0,
+            sampling=sampling,
+            max_new_tokens=max_new_tokens,
+            probe=probe,
+        )
+
+    def generate_ids(
+        self,
+        prompt_ids: Sequence[int],
+        *,
+        sampling: SamplingParams | None = None,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        probe: DebugProbe | None = None,
+    ) -> GenerationResult:
+        return Engine._drain(
+            self.stream_ids(
+                prompt_ids, sampling=sampling, max_new_tokens=max_new_tokens, probe=probe
+            )
+        )
+
+    def _run(
+        self,
+        ids: list[int],
+        *,
+        tokenize_seconds: float,
+        sampling: SamplingParams | None,
+        max_new_tokens: int,
+        probe: DebugProbe | None,
+    ) -> Iterator[GenerationStep]:
+        """Stream one request, counting it as a turn when its result is delivered.
+
+        Not after the generator finishes. ``yield from`` returns only if the
+        consumer reads to the end, and a caller that stops as soon as it has the
+        final step — which carries the complete :class:`GenerationResult`, so
+        there is nothing left to read — closes the generator instead. Counting
+        there reported ``turns=0`` for a request that had finished and been handed
+        over.
+
+        So the increment sits immediately before the final step's ``yield``: the
+        caller has asked for a value and is about to get the result, which is the
+        moment the request becomes a completed turn. Everything short of that
+        counts as nothing. A ``close()`` or an exception at an earlier step
+        resumes the generator nowhere, so the line is never reached; a stream that
+        is exhausted normally reaches it once, because ``_stream`` yields exactly
+        one ``finished`` step and then returns.
+        """
+        # Validated before planning: an over-long prompt must be refused without
+        # truncating the cache first, or a bad request would cost the good prefix.
+        ids = self._engine._validate_request(ids, max_new_tokens)
+        start = self._plan(ids)
+        counted = False
+        for step in self._engine._stream(
+            ids,
+            cache=self._cache,
+            prefill_from=start,
+            sampling=sampling,
+            max_new_tokens=max_new_tokens,
+            tokenize_seconds=tokenize_seconds,
+            vision_encode_seconds=0.0,
+            probe=probe,
+            prefill_embeds=None,
+            reused_tokens=start,
+            committed=self._committed,
+        ):
+            if step.finished and not counted:
+                self._turns += 1
+                counted = True
+            yield step
+
+    # ---- internals ----------------------------------------------------------
+
+    def _check_identity(self) -> None:
+        """Refuse to reuse a cache that no longer describes this engine's model.
+
+        A session pins the engine it was built from, so this can only fire if the
+        model or its geometry was swapped underneath it. The buffers were allocated
+        from the *old* layer count and head shape, so continuing would write K/V
+        into slots the current model reads as something else — wrong output with no
+        error. A handful of integer comparisons per request is cheap insurance.
+        """
+        engine = self._engine
+        if engine.model is not self._model:
+            raise RuntimeError(
+                "the engine's model was replaced after this session was created; "
+                "the session's KV cache describes the previous one. Build a new "
+                "session with engine.session()."
+            )
+        current = self._geometry(engine)
+        if current != self._identity:
+            raise RuntimeError(
+                f"the engine's model geometry changed from {self._identity} to "
+                f"{current} (layers, kv heads, head dim, vocab, max_context); the "
+                "session's KV cache no longer matches it. Build a new session."
+            )
+
+    def _plan(self, ids: Sequence[int]) -> int:
+        """Truncate the cache to the recognised prefix and return where to resume.
+
+        The return value is the index into ``ids`` of the first token that is not
+        already cached, so ``ids[result:]`` is exactly what gets prefilled.
+        """
+        self._check_identity()
+        cache = self._cache
+        length_before = cache.length
+
+        # A request that failed mid-prefill commits the chunks it finished before
+        # raising, so the cache can hold more tokens than this session recorded.
+        # Dropping the unrecorded tail from ``_committed`` is safe, not lossy: the
+        # reuse boundary can never exceed what is recorded, and every slot at or
+        # past it is either overwritten by this prefill or left beyond ``length``,
+        # where nothing reads it.
+        del self._committed[length_before:]
+
+        reuse = common_prefix_length(self._committed, ids)
+        # A full match still needs one forward. The cache holds K/V for the last
+        # prompt token, but generation samples from its logits, and those were
+        # never computed: the token that would have produced them is the previous
+        # reply's stop token, which the decode loop never feeds back. Re-running
+        # that single position costs one decode step instead of a whole prefill.
+        start = len(ids) - 1 if reuse == len(ids) else reuse
+
+        cache.truncate(start)
+        del self._committed[start:]
+        self._last_reuse = SessionReuse(
+            prompt_tokens=len(ids),
+            reused_tokens=start,
+            prefilled_tokens=len(ids) - start,
+            discarded_tokens=length_before - start,
+            cache_length_before=length_before,
+        )
+        return start
+
+    def __repr__(self) -> str:
+        return (
+            f"Session(turns={self._turns}, cached_tokens={self._cache.length}, "
+            f"max_context={self._cache.max_context}, "
+            f"allocated={self._cache.allocated_bytes() / 2**20:.1f} MiB)"
+        )

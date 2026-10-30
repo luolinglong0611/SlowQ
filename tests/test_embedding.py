@@ -16,11 +16,15 @@ are easy to get wrong while still producing plausible-looking numbers:
 * a multi-chunk encode lands on the same vector as a single-chunk one, **and**
   actually ran as several chunks — an equivalence assertion alone passes just as
   happily when nothing was split;
+* an index built by ``index_documents`` returns what ``search`` returns, having
+  encoded each document once instead of once per query;
+* an index whose engine has since been reconfigured refuses to answer, rather
+  than scoring a fresh query against vectors it is no longer comparable with;
 
-That last one is a regression: ``encode_ids`` used to pool at ``len(ids)`` while
-``decoded.hidden_states`` held only the last chunk's rows, so any text longer
-than ``prefill_chunk_size`` raised instead of embedding. Numerically comparing
-the two chunkings against the official model is
+The chunking bullet is a regression: ``encode_ids`` used to pool at ``len(ids)``
+while ``decoded.hidden_states`` held only the last chunk's rows, so any text
+longer than ``prefill_chunk_size`` raised instead of embedding. Numerically
+comparing the two chunkings against the official model is
 ``tools/validate_reference.py``'s job; this is the offline half.
 """
 
@@ -40,6 +44,7 @@ from slowq.embedding import (
     DEFAULT_MAX_LENGTH,
     DEFAULT_PREFILL_CHUNK_SIZE,
     DEFAULT_QUERY_INSTRUCTION,
+    DocumentIndex,
     EmbeddingBatch,
     EmbeddingEngine,
     EmbeddingModel,
@@ -50,6 +55,7 @@ from slowq.embedding import (
 )
 from slowq.errors import ConfigError, ContextOverflowError, UnsupportedInputError
 from slowq.ops import l2_normalize
+from slowq.tokenizer import Tokenizer
 from slowq.weights import Weights
 
 DOCUMENT = "慢炖用 NumPy 在 CPU 上跑小模型，一步一步把 token 炖出来。"
@@ -483,3 +489,363 @@ def test_search_without_an_instruction_leaves_the_query_bare(engine):
 def test_search_needs_at_least_one_document(engine):
     with pytest.raises(UnsupportedInputError, match="at least one document"):
         engine.search(QUERY, [])
+
+
+# --------------------------------------------------------------------------- #
+# 6. the pre-encoded corpus: index_documents and DocumentIndex
+# --------------------------------------------------------------------------- #
+
+#: Four documents, one of which is the query's own text so that a ranking has a
+#: self-match to find. Kept short: the staleness test below builds an engine with
+#: a small ``max_length``, and SlowQ refuses rather than truncates.
+CORPUS = (
+    DOCUMENT,
+    "慢炖的权重是只读 mmap 的，加载之后不会被改写。",
+    "KV cache 让自回归解码每一步只算一个新 token。",
+    "a third unrelated passage about soup",
+)
+
+QUERIES = (QUERY, "什么是 KV cache？", "权重是怎么加载的？")
+
+
+def count_document_encodes(engine: EmbeddingEngine, monkeypatch) -> list[str]:
+    """Every text ``encode_document`` is asked for, in order.
+
+    The index's claim is "each document is encoded once, however many queries
+    follow", and a claim about work *not* done is only checkable by watching the
+    call. Query encodes are deliberately not recorded: one per search is the
+    documented cost of the answer.
+    """
+    seen: list[str] = []
+    real = engine.encode_document
+
+    def counted(text: str):
+        seen.append(text)
+        return real(text)
+
+    monkeypatch.setattr(engine, "encode_document", counted)
+    return seen
+
+
+def test_index_search_matches_the_plain_search_exactly(engine):
+    """Vectors, scores, order and tokenisation — compared, not approximated.
+
+    Both entry points rank through the same :func:`rank_documents` and encode
+    documents through the same :meth:`EmbeddingEngine.encode_document`, so this
+    can be an equality assertion. If it ever has to become an ``allclose``, the
+    two paths have drifted and "the index gives a different answer than search"
+    has become a possible failure mode.
+    """
+    index = engine.index_documents(CORPUS)
+    for query in QUERIES:
+        plain_batch, plain_ranking = engine.search(query, CORPUS)
+        index_batch, index_ranking = index.search(query)
+
+        assert index_ranking == plain_ranking, query
+        assert [result.text for result in index_batch.results] == [
+            result.text for result in plain_batch.results
+        ]
+        assert [result.input_ids for result in index_batch.results] == [
+            result.input_ids for result in plain_batch.results
+        ]
+        assert np.array_equal(index_batch.vectors, plain_batch.vectors), query
+        assert index_batch.similarity is not None
+        assert plain_batch.similarity is not None
+        np.testing.assert_array_equal(
+            index_batch.similarity, plain_batch.similarity, err_msg=query
+        )
+        assert index_batch.similarity.shape == (1, len(CORPUS))
+
+
+def test_the_corpus_is_encoded_once_however_many_queries_follow(engine, monkeypatch):
+    seen = count_document_encodes(engine, monkeypatch)
+    index = engine.index_documents(CORPUS)
+    assert seen == list(CORPUS), "building the index encodes every document once"
+
+    seen.clear()
+    for query in QUERIES:
+        index.search(query)
+    assert seen == [], f"{len(QUERIES)} queries re-encoded documents: {seen}"
+    assert index.stats()["searches"] == len(QUERIES)
+
+
+def test_the_plain_search_still_encodes_every_document_every_call(engine, monkeypatch):
+    """The cost the index exists to remove, measured rather than asserted away."""
+    seen = count_document_encodes(engine, monkeypatch)
+    for query in QUERIES:
+        engine.search(query, CORPUS)
+    assert seen == list(CORPUS) * len(QUERIES)
+
+
+def test_index_documents_reports_the_corpus_it_holds(engine):
+    index = engine.index_documents(CORPUS)
+    assert isinstance(index, DocumentIndex)
+    assert len(index) == len(CORPUS) == 4
+    assert index.documents == CORPUS
+    assert [result.text for result in index.results] == list(CORPUS)
+    assert index.dimension == engine.dimension == engine.config.hidden_size
+    assert index.vectors.shape == (len(CORPUS), engine.dimension)
+    assert index.num_tokens == sum(r.num_tokens for r in index.results) > 0
+    assert index.build_seconds >= 0.0
+    assert index.stats() == {
+        "documents": len(CORPUS),
+        "tokens": index.num_tokens,
+        "dimension": engine.dimension,
+        "build_seconds": index.build_seconds,
+        "searches": 0,
+    }
+    assert f"{len(CORPUS)} document(s)" in repr(index)
+    for result in index.results:
+        assert result.is_query is False, "documents get no instruction prefix"
+        assert abs(float(np.linalg.norm(result.vector)) - 1.0) < 1e-6
+
+
+def test_the_index_encodes_documents_verbatim_like_search_does(engine):
+    """Otherwise the two entry points would score different texts."""
+    index = engine.index_documents(CORPUS)
+    for result in index.results:
+        assert result.text in CORPUS
+        assert "Instruct:" not in result.text
+        assert result.input_ids == tuple(
+            engine.tokenizer.encode(result.text, add_special_tokens=True)
+        )
+
+
+def test_the_vector_matrix_is_a_copy_the_caller_cannot_write_through(engine):
+    """The index must never hand out a buffer it also scores against."""
+    index = engine.index_documents(CORPUS)
+    _, before = index.search(QUERY)
+
+    matrix = index.vectors
+    matrix[:] = 0.0
+    assert index.vectors is not matrix
+    assert abs(float(np.linalg.norm(index.vectors[0])) - 1.0) < 1e-6
+
+    _, after = index.search(QUERY)
+    assert after == before, "editing a matrix the index handed out changed its answers"
+
+
+# ``index.vectors`` stacking a fresh matrix is only one of the four ways a caller
+# can reach the corpus. The other three hand out ``EmbeddingResult`` objects, and
+# a frozen dataclass freezes the *reference* to ``vector``, not the array it
+# points at — so ``result.vector[:] = 0`` is still a write, and while the index
+# held the same objects those writes re-scored the corpus permanently. Each test
+# below is one of those routes, and each was reproduced against the unfixed code.
+
+
+def test_mutating_the_arrays_handed_to_the_constructor_does_not_reach_the_index(engine):
+    """Route 1: ``DocumentIndex(engine, results)`` kept the caller's buffers."""
+    results = [engine.encode_document(text) for text in CORPUS]
+    index = DocumentIndex(engine, results)
+    _, before = index.search(QUERY)
+
+    results[1].vector[:] = 0.0
+
+    _, after = index.search(QUERY)
+    assert after == before, "editing an array given to the constructor changed the index"
+    assert abs(float(np.linalg.norm(index.results[1].vector)) - 1.0) < 1e-6
+
+
+def test_mutating_a_vector_read_from_results_does_not_reach_the_index(engine):
+    """Route 2: ``.results`` returned the index's own objects, not copies."""
+    index = engine.index_documents(CORPUS)
+    _, before = index.search(QUERY)
+
+    index.results[1].vector[:] = 0.0
+
+    _, after = index.search(QUERY)
+    assert after == before, "editing a vector read from .results changed the answers"
+    assert abs(float(np.linalg.norm(index.results[1].vector)) - 1.0) < 1e-6
+
+
+def test_mutating_a_vector_returned_by_search_does_not_reach_the_index(engine):
+    """Route 3, the reported reproduction: zero a document, watch the rank move.
+
+    Before the fix this changed every later query's scores and ranking, while
+    ``engine.search`` — which re-encodes the corpus — still produced the original
+    answer. Two entry points disagreeing about the same corpus is exactly the
+    failure mode the index exists to remove, and it was invisible: the scores
+    still looked like cosine similarities.
+    """
+    index = engine.index_documents(CORPUS)
+    _, before = index.search(QUERY)
+
+    batch, ranking = index.search(QUERY)
+    batch.results[1].vector[:] = 0.0
+
+    _, after = index.search(QUERY)
+    assert after == before, "editing a vector from search() changed later answers"
+    assert ranking == before
+
+
+def test_a_mutated_index_still_agrees_with_a_fresh_search(engine):
+    """The consequence of routes 1–3, stated as the contract that was broken.
+
+    ``index.search`` is documented to return exactly what
+    ``EmbeddingEngine.search`` returns. That is only true if nothing a caller did
+    to a previous result can reach the corpus, so this asserts it *after* writing
+    to all three routes rather than on a pristine index.
+    """
+    index = engine.index_documents(CORPUS)
+    held = [engine.encode_document(text) for text in CORPUS]
+    other = DocumentIndex(engine, held)
+
+    index.results[0].vector[:] = 0.0
+    other.search(QUERY)[0].results[2].vector[:] = 0.0
+    held[3].vector[:] = 0.0
+
+    for query in QUERIES:
+        plain_batch, plain_ranking = engine.search(query, CORPUS)
+        index_batch, index_ranking = index.search(query)
+        assert index_ranking == plain_ranking, query
+        np.testing.assert_array_equal(index_batch.similarity, plain_batch.similarity, query)
+        np.testing.assert_array_equal(index_batch.vectors, plain_batch.vectors, query)
+
+        other_batch, other_ranking = other.search(query)
+        assert other_ranking == plain_ranking, query
+        np.testing.assert_array_equal(other_batch.vectors, plain_batch.vectors, query)
+
+
+def test_every_array_the_index_hands_out_is_a_distinct_buffer(engine):
+    """Route 4: isolation between the accessors themselves, not just from callers.
+
+    Two searches, ``.results`` and ``.vectors`` must not alias one buffer, or a
+    write to any of them is a write to the rest. Identity is the assertion here
+    rather than value equality — equal contents in one shared buffer is the bug.
+
+    Note the offset, which is a trap of its own: a batch is ``(query,
+    *documents)`` so document *k* sits at ``batch.results[k + 1]``, while
+    ``.results`` and ``.vectors`` hold documents only and put it at ``[k]``.
+    """
+    index = engine.index_documents(CORPUS)
+    document = 1
+    first, _ = index.search(QUERY)
+    second, _ = index.search(QUERIES[1])
+    held = index.results
+    matrix = index.vectors
+
+    buffers = [
+        first.results[document + 1].vector,
+        second.results[document + 1].vector,
+        held[document].vector,
+        index.results[document].vector,
+        matrix[document],
+    ]
+    for i, left in enumerate(buffers):
+        for right in buffers[i + 1 :]:
+            assert left is not right and not np.shares_memory(left, right)
+
+    for other in buffers[1:]:
+        np.testing.assert_array_equal(buffers[0], other)
+    assert abs(float(np.linalg.norm(buffers[0])) - 1.0) < 1e-6
+
+
+def test_the_query_result_from_search_is_also_the_callers_own(engine):
+    """``results[0]`` is the query, encoded fresh per call — assert it stays that way.
+
+    Not a leak that existed, but the isolation contract is stated for the whole
+    batch and the query is position 0 of it. If a future change ever caches query
+    encodes, this is the test that notices the batch became shared.
+    """
+    index = engine.index_documents(CORPUS)
+    first, _ = index.search(QUERY)
+    pristine = first.results[0].vector.copy()
+
+    second, _ = index.search(QUERY)
+    assert first.results[0].vector is not second.results[0].vector
+
+    first.results[0].vector[:] = 0.0
+    np.testing.assert_array_equal(second.results[0].vector, pristine)
+
+
+def test_a_query_is_still_encoded_by_every_search(engine, monkeypatch):
+    """Documented on purpose: caching queries would make this a memo table."""
+    index = engine.index_documents(CORPUS)
+    seen: list[str] = []
+    real = engine.encode_query
+
+    def counted(text, **kwargs):
+        seen.append(text)
+        return real(text, **kwargs)
+
+    monkeypatch.setattr(engine, "encode_query", counted)
+    for query in QUERIES:
+        index.search(query)
+    assert seen == list(QUERIES)
+
+
+def test_an_empty_corpus_is_refused_by_both_entry_points(engine):
+    with pytest.raises(UnsupportedInputError, match="at least one document"):
+        engine.index_documents([])
+    with pytest.raises(UnsupportedInputError, match="at least one document"):
+        DocumentIndex(engine, [])
+
+
+def test_a_single_document_corpus_is_allowed(engine):
+    index = engine.index_documents([DOCUMENT])
+    batch, ranking = index.search(QUERY)
+    assert [position for position, _ in ranking] == [0]
+    assert ranking[0][1] == pytest.approx(float(batch.similarity[0][0]))
+    assert index.vectors.shape == (1, engine.dimension)
+
+
+def test_an_index_refuses_to_answer_after_the_engine_changed_underneath_it(
+    engine, tiny_embedding_dir: Path, monkeypatch
+):
+    """A stale index would still return plausible cosine scores. That is the danger.
+
+    Each case is undone before the next, so every one is checked against the same
+    index rather than against the wreckage of the previous mutation.
+    """
+    index = engine.index_documents(CORPUS)
+
+    original_model = engine.model
+    engine.model = EmbeddingModel.from_directory(tiny_embedding_dir)
+    with pytest.raises(RuntimeError, match="model was replaced"):
+        index.search(QUERY)
+    engine.model = original_model
+
+    original_tokenizer = engine.tokenizer
+    engine.tokenizer = Tokenizer.from_directory(
+        tiny_embedding_dir, require_chat_template=False
+    )
+    with pytest.raises(RuntimeError, match="tokenizer was replaced"):
+        index.search(QUERY)
+    engine.tokenizer = original_tokenizer
+
+    original_chunk = engine.prefill_chunk_size
+    engine.prefill_chunk_size = original_chunk * 2
+    with pytest.raises(RuntimeError, match="prefill_chunk_size changed"):
+        index.search(QUERY)
+    engine.prefill_chunk_size = original_chunk
+
+    monkeypatch.setattr(engine.model.weights, "fingerprint", lambda: ("other",))
+    with pytest.raises(RuntimeError, match="weights changed"):
+        index.search(QUERY)
+    monkeypatch.undo()
+
+    # Nothing was mutated for good: the index answers again, and answers the same
+    # thing the plain search does.
+    _, ranking = index.search(QUERY)
+    _, plain = engine.search(QUERY, CORPUS)
+    assert ranking == plain
+
+
+def test_widening_max_length_does_not_invalidate_an_index(tiny_embedding_dir: Path):
+    """``max_length`` bounds what is *refused*, never what is computed.
+
+    SlowQ raises rather than truncating, so no vector in an index came from a
+    truncated encode: raising the limit afterwards cannot change what a stored
+    vector means, and refusing to search over it would be an annoyance with no
+    correctness behind it.
+    """
+    engine = EmbeddingEngine.from_directory(
+        tiny_embedding_dir, max_length=200, prefill_chunk_size=4
+    )
+    index = engine.index_documents(CORPUS)
+    _, before = index.search(QUERY)
+
+    engine.max_length = 256
+    assert engine.max_length <= engine.config.max_position_embeddings
+    _, after = index.search(QUERY)
+    assert after == before

@@ -11,13 +11,20 @@ used instead:
   merger be tested without Pillow. Only the tests that actually *read* an image
   skip when Pillow is absent, because ``slowq.vlm`` promises to be importable
   without it.
+
+The last section covers :class:`ImageFeatureCache`, which is where "the vision
+tower runs once per image" is turned into "once per *distinct* image". Its tests
+count ``encode_image`` calls rather than timings, because a count is the claim
+being made and a millisecond is not.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 import re
+import time
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +37,7 @@ from conftest import (
     TINY_VISION_TEXT_ARCHITECTURE,
     TINY_VISION_WRAPPER,
     build_tiny_vision_model,
+    tiny_vision_tensors,
 )
 from slowq.errors import (
     ConfigError,
@@ -37,12 +45,14 @@ from slowq.errors import (
     UnsupportedInputError,
     WeightError,
 )
-from slowq.model import DebugProbe
+from slowq.model import CausalLMModel, DebugProbe
 from slowq.ops import conv2d_patchify, gelu_tanh, layer_norm, pixel_shuffle, rms_norm
 from slowq.vlm import (
+    DEFAULT_IMAGE_CACHE_BYTES,
     FAKE_IMAGE_TOKEN,
     GLOBAL_IMAGE_TAG,
     IMAGE_TOKEN,
+    ImageFeatureCache,
     ImagePreprocessor,
     ImageProcessorConfig,
     PreparedImage,
@@ -967,6 +977,25 @@ def watch_encode_image(engine, monkeypatch) -> list[int]:
     return calls
 
 
+def model_over_same_weights(model: SmolVLMModel, **config_fields) -> SmolVLMModel:
+    """A second model over *this model's own* ``Weights``, with replaced config fields.
+
+    Sharing the ``Weights`` object is the point. ``Weights.fingerprint()`` reads the
+    manifest and nothing else, and it is the same manifest, so a fingerprint-only
+    identity check cannot see this swap at all — it returns the same tuple, decides
+    nothing changed, and keeps serving. ``dataclasses.replace`` rather than a second
+    directory for the same reason: nothing on disk moved either.
+
+    The fields used by the callers below are all legal compute parameters, so no
+    loader refuses them, no shape changes and no row count changes. That is what
+    makes the failure silent rather than an exception.
+    """
+    config = model.vlm_config
+    for field, value in config_fields.items():
+        config = dataclasses.replace(config, **{field: value})
+    return SmolVLMModel(config, model.weights)
+
+
 #: ``(max_new_tokens, exception, a fragment of its message)`` for requests the
 #: shared validation must refuse. ``True`` is listed because ``bool`` is an
 #: ``int`` in Python, and ``max_new_tokens=True`` silently meaning "one token"
@@ -1159,11 +1188,775 @@ def test_repeating_an_image_request_after_a_refused_one_still_generates(
     prompt = hand_built_prompt()
     drain(engine.stream_prompt(prompt, max_new_tokens=3))
     first = drain(engine.stream_prompt(prompt, max_new_tokens=3))
+    # One encode for two requests, not two: the second finds the same pixels in
+    # the image-feature cache and never reaches the vision tower. Captured as a
+    # count rather than assumed, so the refusal check below is about the refusal.
+    encoded_before_refusal = len(calls)
+    assert encoded_before_refusal == 1
 
     with pytest.raises(ValueError):
         engine.stream_prompt(prompt, max_new_tokens=0)
-    assert len(calls) == 2, "the refused request must not have encoded anything"
+    assert len(calls) == encoded_before_refusal, (
+        "the refused request must not have encoded anything"
+    )
 
     after = drain(engine.stream_prompt(prompt, max_new_tokens=3))
     assert after.token_ids == first.token_ids
     assert engine.kv_cache.length == len(prompt.token_ids) + len(first.token_ids) - 1
+
+
+# --------------------------------------------------------------------------- #
+# 10. image feature reuse: one vision tower run per image, not per request
+# --------------------------------------------------------------------------- #
+
+
+def feature_block(width: int = 8, value: float = 0.0) -> np.ndarray:
+    """A ``[4, width]`` float32 array, so its ``nbytes`` is exactly ``16 * width``.
+
+    The shape is arbitrary; the byte count is not, because every budget assertion
+    below is written in terms of it.
+    """
+    return np.full((4, width), value, dtype=np.float32)
+
+
+def test_a_miss_then_a_hit_returns_the_same_numbers_and_counts_both():
+    cache = ImageFeatureCache(max_bytes=1024)
+    stored = feature_block()
+    assert cache.get("k") is None
+    assert (cache.hits, cache.misses, cache.evictions) == (0, 1, 0)
+
+    assert cache.put("k", stored) is True
+    got = cache.get("k")
+    assert got is not None and np.array_equal(got, stored)
+    assert got.dtype == np.float32
+    assert (cache.hits, cache.misses) == (1, 1)
+    assert len(cache) == 1 and "k" in cache and "other" not in cache
+    assert cache.nbytes == stored.nbytes == 128
+
+    stats = cache.stats()
+    assert stats["hit_rate"] == pytest.approx(0.5)
+    assert stats["entries"] == 1 and stats["bytes"] == 128
+    assert stats["max_bytes"] == 1024
+    assert "bytes=128/1024" in repr(cache)
+
+
+def test_the_cache_owns_its_buffers_in_both_directions():
+    """``put`` copies in, ``get`` copies out, so no two holders share an array.
+
+    The engine hands the returned features to the decoder as the prefill's
+    embedding rows. If the cache handed out the buffer it also scores the next
+    request against, one caller writing into it would silently change what every
+    later caller receives.
+    """
+    cache = ImageFeatureCache(max_bytes=1024)
+    stored = feature_block(value=1.0)
+    cache.put("k", stored)
+
+    stored[:] = 2.0  # the caller kept writing after handing the array over
+    first = cache.get("k")
+    assert np.all(first == 1.0), "put must not keep a reference to the caller's array"
+
+    first[:] = 3.0  # and a reader must not write through to the cache either
+    second = cache.get("k")
+    assert np.all(second == 1.0), "get must not hand out the stored array itself"
+    assert second is not first
+
+
+def test_the_budget_is_enforced_least_recently_used_first():
+    entry = feature_block(8)  # 128 bytes each
+    cache = ImageFeatureCache(max_bytes=2 * entry.nbytes)
+    for key in ("a", "b", "c"):
+        assert cache.put(key, entry) is True
+
+    assert "a" not in cache, "the oldest entry is the one that has to go"
+    assert "b" in cache and "c" in cache
+    assert cache.evictions == 1
+    assert cache.nbytes == 2 * entry.nbytes, "an eviction has to give the bytes back"
+
+
+def test_reading_an_entry_makes_it_the_most_recently_used():
+    """LRU, not FIFO: a picture that keeps getting asked about stays cached."""
+    entry = feature_block(8)
+    cache = ImageFeatureCache(max_bytes=2 * entry.nbytes)
+    cache.put("a", entry)
+    cache.put("b", entry)
+    assert cache.get("a") is not None
+
+    cache.put("c", entry)
+    assert "b" not in cache, "the untouched entry should have been evicted, not 'a'"
+    assert "a" in cache and "c" in cache
+
+
+def test_replacing_a_key_does_not_double_count_its_bytes():
+    cache = ImageFeatureCache(max_bytes=1024)
+    cache.put("k", feature_block(8))
+    assert cache.put("k", feature_block(4)) is True
+    assert len(cache) == 1
+    assert cache.nbytes == feature_block(4).nbytes == 64
+    assert cache.evictions == 0
+
+
+def test_an_entry_larger_than_the_whole_budget_is_skipped_not_thrashed():
+    """Storing it would evict everything else and then not fit either."""
+    cache = ImageFeatureCache(max_bytes=feature_block(8).nbytes)
+    assert cache.put("small", feature_block(4)) is True
+
+    assert cache.put("huge", feature_block(16)) is False
+    assert "huge" not in cache
+    assert cache.evictions == 0, "an entry that cannot fit must not evict to try"
+    assert cache.get("small") is not None, "the usable entry survived"
+
+
+def test_a_zero_budget_disables_the_cache():
+    cache = ImageFeatureCache(max_bytes=0)
+    assert cache.put("k", feature_block()) is False
+    assert len(cache) == 0 and cache.nbytes == 0
+    assert cache.get("k") is None
+    assert (cache.hits, cache.misses) == (0, 1)
+    assert cache.stats()["hit_rate"] == 0.0
+
+
+def test_a_negative_budget_is_refused():
+    with pytest.raises(ValueError, match=">= 0"):
+        ImageFeatureCache(max_bytes=-1)
+
+
+def test_clear_drops_the_entries_but_keeps_the_history():
+    cache = ImageFeatureCache(max_bytes=1024)
+    cache.put("k", feature_block())
+    cache.get("k")
+    cache.get("absent")
+    cache.clear()
+
+    assert len(cache) == 0 and cache.nbytes == 0
+    # The counters describe this engine's lifetime, and freeing memory has not
+    # un-happened the hit that was already served.
+    assert (cache.hits, cache.misses) == (1, 1)
+
+
+def test_two_requests_over_one_image_run_the_vision_tower_once(
+    tiny_vlm_engine, monkeypatch
+):
+    """The claim, as a call count: a hit must not reach ``encode_image`` at all."""
+    engine = tiny_vlm_engine
+    calls = watch_encode_image(engine, monkeypatch)
+    prompt = hand_built_prompt()
+
+    first = drain(engine.stream_prompt(prompt, max_new_tokens=3))
+    second = drain(engine.stream_prompt(prompt, max_new_tokens=3))
+
+    assert calls == [prompt.image.num_frames], (
+        f"the second request re-ran the tower: {calls}"
+    )
+    assert [step.metrics.vision_cache_hit for step in (first, second)] == [False, True]
+    assert second.token_ids == first.token_ids
+    assert second.text == first.text
+    assert engine.image_features.stats()["entries"] == 1
+
+
+def test_the_lookup_is_on_pixel_content_not_on_python_object_identity(
+    tiny_vlm_engine, monkeypatch
+):
+    """No two requests ever share a ``PreparedImage``, so identity cannot be the key.
+
+    ``build_prompt`` makes a new one per call, and ``ImagePreprocessor.prepare``
+    allocates fresh pixel arrays, so an ``id()``-based key would have a hit rate
+    of exactly zero while looking like a cache.
+    """
+    engine = tiny_vlm_engine
+    calls = watch_encode_image(engine, monkeypatch)
+    prompt = hand_built_prompt()
+    drain(engine.stream_prompt(prompt, max_new_tokens=3))
+
+    copy = dataclasses.replace(
+        prompt,
+        image=dataclasses.replace(
+            prompt.image,
+            pixel_values=np.array(prompt.image.pixel_values),
+            pixel_attention_mask=np.array(prompt.image.pixel_attention_mask),
+        ),
+    )
+    assert copy.image is not prompt.image
+    assert copy.image.pixel_values is not prompt.image.pixel_values
+
+    again = drain(engine.stream_prompt(copy, max_new_tokens=3))
+    assert calls == [prompt.image.num_frames], f"a copy missed the cache: {calls}"
+    assert again.metrics.vision_cache_hit is True
+
+
+def test_one_changed_pixel_is_a_different_image(tiny_vlm_engine, monkeypatch):
+    """The other direction: a near-miss must not be served as a hit."""
+    engine = tiny_vlm_engine
+    calls = watch_encode_image(engine, monkeypatch)
+    prompt = hand_built_prompt()
+    drain(engine.stream_prompt(prompt, max_new_tokens=3))
+
+    pixels = np.array(prompt.image.pixel_values)
+    pixels[0, 0, 0, 0] += 1e-3
+    other = dataclasses.replace(prompt, image=prepared(pixels))
+    changed = drain(engine.stream_prompt(other, max_new_tokens=3))
+
+    assert calls == [3, 3], f"the modified image was served from cache: {calls}"
+    assert changed.metrics.vision_cache_hit is False
+    assert len(engine.image_features) == 2
+
+    # The precondition, checked after the counts above so the two direct encodes
+    # do not disturb them: these really are different images, so a hit would have
+    # been a wrong answer rather than merely a fast one.
+    assert not np.array_equal(
+        engine.model.encode_image(prompt.image).features,
+        engine.model.encode_image(other.image).features,
+    )
+
+
+def test_a_debug_probe_bypasses_the_cache(tiny_vlm_engine, monkeypatch):
+    """A probe asks what *this* request computed, so it must not be served an old one."""
+    engine = tiny_vlm_engine
+    calls = watch_encode_image(engine, monkeypatch)
+    prompt = hand_built_prompt()
+    drain(engine.stream_prompt(prompt, max_new_tokens=3))
+    assert len(engine.image_features) == 1
+
+    probe = DebugProbe(positions=(-1,), captures=frozenset({"logits"}))
+    watched = drain(engine.stream_prompt(prompt, max_new_tokens=3, probe=probe))
+    assert calls == [3, 3], "the probed request was served from the cache"
+    assert watched.metrics.vision_cache_hit is False
+    assert "logits[-1]" in probe.records
+
+    after = drain(engine.stream_prompt(prompt, max_new_tokens=3))
+    assert after.metrics.vision_cache_hit is True
+    # Still two encodes: the bypass neither reads nor writes, so the probed
+    # request left the cache exactly as it found it and the third one hits.
+    assert calls == [3, 3]
+    assert after.token_ids == watched.token_ids, "the bypass must not change the answer"
+
+
+def test_two_questions_about_one_picture_share_the_tower(
+    pil, tiny_vlm_single_frame_dir: Path, monkeypatch
+):
+    """The user-visible case, through the entry point the CLI uses."""
+    engine = VisionEngine.from_directory(tiny_vlm_single_frame_dir, max_context=128)
+    calls = watch_encode_image(engine, monkeypatch)
+    image = gradient_image(pil, 8, 8)
+
+    first_prompt = engine.build_prompt(image, "What is in this picture?")
+    second_prompt = engine.build_prompt(image, "Say more about it.")
+    assert first_prompt.token_ids != second_prompt.token_ids, (
+        "the two questions must produce different prompts, or this proves nothing"
+    )
+
+    first = drain(engine.stream_prompt(first_prompt, max_new_tokens=3))
+    second = drain(engine.stream_prompt(second_prompt, max_new_tokens=3))
+    assert calls == [1], f"the tower ran per question: {calls}"
+    assert [step.metrics.vision_cache_hit for step in (first, second)] == [False, True]
+    # One entry for two prompts: the question is not part of the key, and must
+    # not be, or every rephrasing would pay for the tower again.
+    assert engine.image_features.stats()["entries"] == 1
+
+
+def test_the_cache_does_not_change_the_answer(tiny_vlm_dir: Path):
+    """Cached, disabled and too-small-to-hold-anything all decode the same tokens."""
+    prompt = hand_built_prompt()
+    outputs = []
+    for budget in (DEFAULT_IMAGE_CACHE_BYTES, 0, 1):
+        engine = VisionEngine.from_directory(
+            tiny_vlm_dir, max_context=128, image_cache_bytes=budget
+        )
+        drain(engine.stream_prompt(prompt, max_new_tokens=3))  # warm it, if it can
+        result = drain(engine.stream_prompt(prompt, max_new_tokens=3))
+        assert engine.image_features.max_bytes == budget
+        outputs.append(result.token_ids)
+    assert outputs[0] == outputs[1] == outputs[2]
+
+
+def test_a_refused_request_neither_looks_up_nor_stores(tiny_vlm_engine):
+    """Validation still runs first, so a bad request touches no cache state."""
+    engine = tiny_vlm_engine
+    prompt = hand_built_prompt()
+    drain(engine.stream_prompt(prompt, max_new_tokens=3))
+    drain(engine.stream_prompt(prompt, max_new_tokens=3))
+
+    before = engine.image_features.stats()
+    assert (before["hits"], before["misses"], before["entries"]) == (1, 1, 1), (
+        "the precondition: one miss that stored, then one hit"
+    )
+
+    with pytest.raises(ValueError, match="max_new_tokens must be >= 1"):
+        engine.stream_prompt(prompt, max_new_tokens=0)
+
+    after = engine.image_features.stats()
+    # Field by field rather than ``after == before``: ``hit_rate`` is NaN when
+    # nothing has been looked up, and NaN != NaN would fail for the wrong reason.
+    for key in before:
+        assert after[key] == before[key], key
+
+
+def test_a_hit_reports_the_time_this_request_spent_not_the_earlier_ones(
+    tiny_vlm_engine, monkeypatch
+):
+    """A near-zero ``vision_encode_seconds`` is only meaningful if it really drops.
+
+    The tiny fixture's tower is fast enough that a cached hit and a real encode
+    are hard to tell apart by timing alone, so ``encode_image`` is wrapped in a
+    fixed sleep: the miss has to be at least that slow, and the hit has to be far
+    faster. Otherwise the cache could be reporting the *first* request's encode
+    on every later one and nothing here would notice.
+    """
+    engine = tiny_vlm_engine
+    real = engine.model.encode_image
+    delay = 0.05
+
+    def slow(prepared_image):
+        time.sleep(delay)
+        return real(prepared_image)
+
+    monkeypatch.setattr(engine.model, "encode_image", slow)
+    prompt = hand_built_prompt()
+    miss = drain(engine.stream_prompt(prompt, max_new_tokens=3))
+    hit = drain(engine.stream_prompt(prompt, max_new_tokens=3))
+
+    assert (miss.metrics.vision_cache_hit, hit.metrics.vision_cache_hit) == (False, True)
+    assert miss.metrics.vision_encode_seconds >= delay
+    assert hit.metrics.vision_encode_seconds < delay / 5, (
+        "a hit is still being charged for the tower it skipped"
+    )
+    assert hit.metrics.first_token_seconds < miss.metrics.first_token_seconds
+    assert hit.token_ids == miss.token_ids
+
+    rows = dict(hit.metrics.report())
+    assert "features cached" in rows["vision encode"], rows["vision encode"]
+    assert "features cached" not in dict(miss.metrics.report())["vision encode"]
+
+
+def test_the_cache_key_covers_everything_the_features_depend_on(
+    tiny_vlm_engine, other_weights_vlm_dir: Path
+):
+    """Entry by entry, because a key missing one is a wrong answer, not a slow one.
+
+    Left out of the key: a resize setting, an ``image_seq_len``, a crop grid or a
+    set of weights would all still produce *some* features of the right shape, so
+    the failure would be silent and would look exactly like a fast request.
+
+    The identity half goes through real model objects rather than through the
+    engine's private fields. Writing ``engine._weights_fingerprint`` proved the key
+    *reads* that attribute, which a test can arrange however it likes; it said
+    nothing about whether the engine ever *updates* it, which is the half that was
+    broken. Assigning ``engine.vlm_config`` has the same defect and was corrected
+    here for the same reason: it is derived state that the next identity check
+    overwrites, while the features come from ``engine.model.vlm_config``. A key that
+    followed the derived copy could disagree with the model that computes it.
+    """
+    engine = tiny_vlm_engine
+    image = hand_built_prompt().image
+    base = engine._image_cache_key(image)
+    assert base[-1] == engine._identity
+
+    for replaced in (
+        dataclasses.replace(image, image_seq_len=image.image_seq_len + 1),
+        dataclasses.replace(image, rows=1, cols=1),
+        dataclasses.replace(image, original_size=(64, 64)),
+        dataclasses.replace(image, resized_size=(64, 64)),
+        dataclasses.replace(image, encoder_size=(64, 64)),
+    ):
+        assert engine._image_cache_key(replaced) != base, replaced
+
+    processor = engine.vlm_config.processor
+    original = engine.model
+    for field, value in (
+        ("image_seq_len", processor.image_seq_len + 1),
+        ("max_image_size_longest_edge", processor.max_image_size_longest_edge + 1),
+        ("size_longest_edge", processor.size_longest_edge + 1),
+        ("rescale_factor", processor.rescale_factor * 2),
+        ("image_mean", tuple(v + 0.1 for v in processor.image_mean)),
+        ("image_std", tuple(v * 2 for v in processor.image_std)),
+        ("do_normalize", not processor.do_normalize),
+        ("resample", processor.resample + 1),
+    ):
+        engine.model = model_over_same_weights(
+            original,
+            processor=dataclasses.replace(processor, **{field: value}),
+        )
+        engine._model_identity_changed()
+        assert engine._image_cache_key(image) != base, field
+    engine.model = original
+    engine._model_identity_changed()
+
+    # Same manifest, different vision config. ``layer_norm_eps`` is a legal compute
+    # parameter: nothing refuses the swap, every shape still lines up, and the row
+    # count still matches the mask. Only the key can tell the two towers apart.
+    engine.model = model_over_same_weights(
+        original,
+        vision=dataclasses.replace(original.vlm_config.vision, layer_norm_eps=0.5),
+    )
+    assert engine._model_identity_changed()
+    assert engine._image_cache_key(image) != base, "a changed vision config kept the key"
+
+    # A different weight manifest is a different model, even in the same process.
+    engine.model = SmolVLMModel.from_directory(other_weights_vlm_dir)
+    assert engine._model_identity_changed()
+    assert engine._image_cache_key(image) != base, "a changed checkpoint kept the key"
+
+
+def test_two_engines_on_one_directory_agree_on_the_key(tiny_vlm_dir: Path):
+    """The identity comes from the manifest's contents, not from object identity.
+
+    Which is why the model object is tracked *separately* from :attr:`_identity`
+    rather than folded into it: this equality is what lets two engines over one
+    directory share a meaning for a key, and a per-object component would break it.
+    """
+    image = hand_built_prompt().image
+    first = VisionEngine.from_directory(tiny_vlm_dir, max_context=128)
+    second = VisionEngine.from_directory(tiny_vlm_dir, max_context=128)
+
+    assert first is not second and first.model is not second.model
+    assert first._identity == second._identity
+    assert first._image_cache_key(image) == second._image_cache_key(image)
+
+
+# --------------------------------------------------------------------------- #
+# the model behind a live engine changing
+# --------------------------------------------------------------------------- #
+
+#: The one tensor overridden to make the second checkpoint. It is the whole of
+#: the connector, so two directories differing only here produce different
+#: features from identical pixels while agreeing on every shape.
+CONNECTOR_WEIGHT = "model.connector.modality_projection.proj.weight"
+
+
+@pytest.fixture
+def other_weights_vlm_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A second tiny VLM: same geometry, same processor, different connector.
+
+    Deliberately *not* a different architecture. A geometry check would catch a
+    swapped ``hidden_size``; the bug this fixture reproduces is invisible to one,
+    because the shapes all still line up and the features still have the right
+    row count. Only the weight identity distinguishes the two, which is why the
+    cache key carries a fingerprint at all.
+
+    ``vocab_size`` is irrelevant to the connector's shape, so the override can be
+    generated without knowing the tokenizer this directory will get.
+    """
+    config = dict(
+        TINY_VISION_WRAPPER,
+        text_config=TINY_VISION_TEXT_ARCHITECTURE,
+        vision_config=TINY_VISION_ARCHITECTURE,
+    )
+    other = tiny_vision_tensors(config, seed=987654321)[CONNECTOR_WEIGHT]
+    root = tmp_path_factory.mktemp("tiny-vlm-other") / "tiny-smolvlm-other-weights"
+    build_tiny_vision_model(root, overrides={CONNECTOR_WEIGHT: other})
+    return root
+
+
+def test_swapping_the_model_does_not_serve_the_previous_models_features(
+    tiny_vlm_engine, other_weights_vlm_dir: Path
+):
+    """A real model swap, not a poked fingerprint: the cache must miss.
+
+    Reproduced against the unfixed code. ``_weights_fingerprint`` was read once in
+    ``__init__`` under the comment "the manifest never changes under a loaded
+    engine", so after ``engine.model = other`` the key still carried the *old*
+    fingerprint, the same image hit the same entry, and the engine fused the new
+    decoder with the previous model's image features. Nothing raised: the features
+    had the right shape and the right row count, so the prompt looked fine and the
+    generation was confidently wrong.
+    """
+    engine = tiny_vlm_engine
+    image = hand_built_prompt().image
+
+    first, _, first_hit = engine._vision_features(image, probe=None)
+    assert not first_hit
+    cached, _, cached_hit = engine._vision_features(image, probe=None)
+    assert cached_hit, "an unswapped engine must still hit — the fix is not 'never cache'"
+    np.testing.assert_array_equal(cached, first)
+
+    other = SmolVLMModel.from_directory(other_weights_vlm_dir)
+    assert other.weights.fingerprint() != engine.model.weights.fingerprint()
+    expected = other.encode_image(image).features
+    assert not np.array_equal(expected, first), "the fixture must change the features"
+
+    engine.model = other
+    after, _, after_hit = engine._vision_features(image, probe=None)
+
+    assert not after_hit, "the swapped model was served the previous model's features"
+    assert not np.array_equal(after, first)
+    np.testing.assert_array_equal(after, expected)
+
+
+def test_a_swapped_engine_rewarms_and_then_hits_again(
+    tiny_vlm_engine, other_weights_vlm_dir: Path
+):
+    """Invalidation costs one recompute, not the cache itself.
+
+    If the response to a changed model were "stop caching", the second request
+    would miss too and every later one with it. The contract is that the stale
+    entries go away and the new model's features take their place.
+    """
+    engine = tiny_vlm_engine
+    image = hand_built_prompt().image
+    engine._vision_features(image, probe=None)
+
+    engine.model = SmolVLMModel.from_directory(other_weights_vlm_dir)
+    _, _, miss = engine._vision_features(image, probe=None)
+    _, _, hit = engine._vision_features(image, probe=None)
+
+    assert not miss and hit
+
+
+def test_a_swap_drops_the_unreachable_entries(tiny_vlm_engine, other_weights_vlm_dir: Path):
+    """Old entries must not linger and hold capacity the new model cannot use.
+
+    A changed fingerprint makes every stored key unreachable, so leaving them in
+    place would fill the budget with garbage and evict the new model's live
+    entries — the cache would appear to work while hitting nothing. Two images
+    are needed to see it: with one, "dropped the stale entry and stored a fresh
+    one" and "kept the stale entry and stored nothing" both end at a length of
+    one, and only the contents would tell them apart.
+    """
+    engine = tiny_vlm_engine
+    first_image = hand_built_prompt(num_frames=3).image
+    # A second *image*, not a second frame count: ``image_span`` builds exactly
+    # 20 ids, so a 4-frame prompt has no token sequence to go with it. Same
+    # geometry and different pixels is the case that matters here anyway — two
+    # entries competing for the same budget.
+    second_image = prepared(frames_of(0.5, 0.25, -0.5, num_frames=3))
+    engine._vision_features(first_image, probe=None)
+    engine._vision_features(second_image, probe=None)
+    assert len(engine.image_features) == 2
+
+    engine.model = SmolVLMModel.from_directory(other_weights_vlm_dir)
+    engine._vision_features(first_image, probe=None)
+
+    assert len(engine.image_features) == 1, "a stale entry survived the swap"
+
+
+def test_the_identity_check_reads_the_manifest_and_no_tensor(
+    tiny_vlm_engine, monkeypatch
+):
+    """Detecting a swap must not cost a scan of the weights it protects.
+
+    Hashing the tensors to key a cache that exists to skip one forward would cost
+    more than the forward it saves — the same reason ``Weights.fingerprint`` reads
+    the manifest and never the arrays. This pins that down as behaviour rather
+    than as a docstring promise: a cache **hit** must touch zero tensors, so the
+    check cannot have quietly become a content hash. It passed before the fix too,
+    where it was vacuous; it exists to constrain the fix, not to reproduce the
+    bug.
+    """
+    engine = tiny_vlm_engine
+    image = hand_built_prompt().image
+    engine._vision_features(image, probe=None)
+
+    reads: list[str] = []
+    weights = engine.model.weights
+    for name in ("get", "expect"):
+        real = getattr(weights, name)
+
+        def counted(*args, _real=real, _name=name, **kwargs):
+            reads.append(f"{_name}{args[:1]}")
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(weights, name, counted)
+
+    _, _, hit = engine._vision_features(image, probe=None)
+    assert hit
+    assert reads == [], f"the cache-hit path read tensors: {reads}"
+
+
+def test_a_probe_still_bypasses_the_cache_after_a_swap(
+    tiny_vlm_engine, other_weights_vlm_dir: Path
+):
+    """The debug path is unchanged by identity handling, and must stay so.
+
+    A probe means "show me what *this* request computed", which is why it neither
+    reads nor writes the cache. A swap makes that more true, not less, so the two
+    mechanisms have to compose rather than one short-circuiting the other.
+    """
+    engine = tiny_vlm_engine
+    image = hand_built_prompt().image
+    engine.model = SmolVLMModel.from_directory(other_weights_vlm_dir)
+
+    probe = DebugProbe(captures=frozenset())
+    features, _, hit = engine._vision_features(image, probe=probe)
+    assert not hit
+    np.testing.assert_array_equal(features, engine.model.encode_image(image).features)
+    assert len(engine.image_features) == 0, "a probed request must not populate the cache"
+
+
+# --------------------------------------------------------------------------- #
+# the config behind a live engine changing, with the weights held still
+#
+# ``model_over_same_weights`` lives with the other helpers above; everything here
+# uses it to hold the manifest fingerprint exactly still while the model changes.
+# --------------------------------------------------------------------------- #
+
+
+def test_a_swapped_vision_config_over_the_same_weights_does_not_serve_the_old_features(
+    tiny_vlm_engine,
+):
+    """Same checkpoint, different ``layer_norm_eps``, and the cache must miss.
+
+    Reproduced against the unfixed code, where ``_model_identity_changed`` compared
+    ``weights.fingerprint()`` and returned early on a match. The manifest is the same
+    manifest, so it matched: the old entry was served to the new tower's caller, the
+    features differed from what ``other.encode_image`` produces by up to 0.163 per
+    element, and ``engine.vlm_config`` was still the previous one. Every shape and
+    every row count lined up, so the request completed and was confidently wrong.
+    """
+    engine = tiny_vlm_engine
+    image = hand_built_prompt().image
+
+    first, _, first_hit = engine._vision_features(image, probe=None)
+    assert not first_hit
+    _, _, warm = engine._vision_features(image, probe=None)
+    assert warm, "the cache must be warm, or a miss below proves nothing"
+
+    original = engine.model
+    other = model_over_same_weights(
+        original,
+        vision=dataclasses.replace(original.vlm_config.vision, layer_norm_eps=0.5),
+    )
+    assert other.weights.fingerprint() == original.weights.fingerprint(), (
+        "the fixture must hold the fingerprint still, or this is the weights test"
+    )
+    expected = other.encode_image(image).features
+    assert not np.array_equal(expected, first), "the fixture must change the features"
+
+    engine.model = other
+    after, _, after_hit = engine._vision_features(image, probe=None)
+
+    assert not after_hit, (
+        "a same-weights/different-config swap was served the previous model's features"
+    )
+    np.testing.assert_array_equal(after, expected)
+    assert engine.vlm_config is other.vlm_config, "the swap left the old config in place"
+
+
+def test_a_swapped_preprocessor_config_refreshes_the_preprocessor_and_the_entry(
+    tiny_vlm_engine,
+):
+    """The other half of the same bug, and it bites *before* the lookup.
+
+    ``layer_norm_eps`` changes what a cached entry should hold. A normalization mean
+    changes what the next request will produce, and it does so upstream of the cache:
+    ``build_prompt`` crops with ``self.preprocessor``, so an engine still holding the
+    previous model's settings feeds the new tower pixels it was never configured for.
+    The key carries the processor config, which makes a stale one *self-consistent* —
+    the same wrong settings on both sides of the comparison, so the entry hits.
+    """
+    engine = tiny_vlm_engine
+    image = hand_built_prompt().image
+    engine._vision_features(image, probe=None)
+    _, _, warm = engine._vision_features(image, probe=None)
+    assert warm
+
+    original = engine.model
+    processor = dataclasses.replace(
+        original.vlm_config.processor,
+        image_mean=tuple(v + 0.25 for v in original.vlm_config.processor.image_mean),
+    )
+    other = model_over_same_weights(original, processor=processor)
+    assert other.weights.fingerprint() == original.weights.fingerprint()
+
+    engine.model = other
+    _, _, hit = engine._vision_features(image, probe=None)
+
+    assert not hit, "a different preprocessing config reused the previous entry"
+    assert engine.vlm_config is other.vlm_config
+    assert engine.preprocessor.processor is processor, (
+        "the engine is still cropping images to the previous model's settings"
+    )
+
+
+def test_build_prompt_preprocesses_with_the_swapped_models_settings(
+    pil, tiny_vlm_engine
+):
+    """Through the entry point the CLI uses, with a real image and a real crop.
+
+    The ordering is the guarantee: ``build_prompt`` re-reads the identity *before* it
+    calls ``self.preprocessor.prepare``. Reversed, the first request after a swap
+    would be cropped by the previous model and only the second would be right — a
+    one-request window that no test counting cache hits would ever see.
+    """
+    engine = tiny_vlm_engine
+    image = gradient_image(pil, *WIDE_IMAGE)
+    engine.build_prompt(image, QUESTION)
+
+    original = engine.model
+    processor = dataclasses.replace(
+        original.vlm_config.processor,
+        image_mean=tuple(v + 0.25 for v in original.vlm_config.processor.image_mean),
+    )
+    engine.model = model_over_same_weights(original, processor=processor)
+
+    prompt = engine.build_prompt(image, QUESTION)
+    independent = ImagePreprocessor(processor).prepare(image)
+    np.testing.assert_array_equal(prompt.image.pixel_values, independent.pixel_values)
+    assert not np.array_equal(
+        prompt.image.pixel_values,
+        ImagePreprocessor(original.vlm_config.processor).prepare(image).pixel_values,
+    ), "the fixture must change the pixels, or this asserts nothing"
+
+
+def test_a_config_swap_rewarms_and_then_hits_again(tiny_vlm_engine):
+    """Invalidation costs one recompute, not the cache.
+
+    The config half of ``test_a_swapped_engine_rewarms_and_then_hits_again``: if the
+    response to a changed config were "stop trusting the cache", every later request
+    would miss too and the feature would be gone rather than corrected.
+    """
+    engine = tiny_vlm_engine
+    image = hand_built_prompt().image
+    engine._vision_features(image, probe=None)
+
+    original = engine.model
+    engine.model = model_over_same_weights(
+        original,
+        vision=dataclasses.replace(original.vlm_config.vision, layer_norm_eps=0.5),
+    )
+    _, _, miss = engine._vision_features(image, probe=None)
+    _, _, hit = engine._vision_features(image, probe=None)
+
+    assert not miss and hit
+
+
+def test_requests_without_a_swap_keep_hitting(tiny_vlm_engine):
+    """The identity check must not itself invalidate.
+
+    A check that fired on every request would be invisible from the outside — same
+    answers, same features — while paying for the tower each time, which is the one
+    cost this cache exists to remove. So this counts hits rather than timings: a
+    timing assertion would pass on a machine that was merely fast.
+    """
+    engine = tiny_vlm_engine
+    image = hand_built_prompt().image
+
+    _, _, first = engine._vision_features(image, probe=None)
+    hits = [engine._vision_features(image, probe=None)[2] for _ in range(4)]
+
+    assert not first and hits == [True, True, True, True]
+    assert engine.image_features.stats()["entries"] == 1
+    assert engine.vlm_config is engine.model.vlm_config
+
+
+def test_a_text_only_model_is_refused_rather_than_served_from_the_cache(
+    tiny_vlm_engine, tiny_model_dir: Path
+):
+    """An unsupported replacement raises instead of quietly returning stale features.
+
+    ``VisionEngine.model`` is an ordinary attribute, so any object can be assigned to
+    it. A text-only ``CausalLMModel`` has no ``vlm_config`` and cannot encode an image;
+    the only honest responses are to refuse or to invent an answer. Inventing one here
+    means serving the *previous* model's features for an image the new model has no
+    tower for, which is the failure this whole section exists to prevent.
+
+    ``TypeError`` and not a ``slowq.errors`` type: this is a caller binding the wrong
+    kind of object, not a bad checkpoint or a bad request.
+    """
+    engine = tiny_vlm_engine
+    image = hand_built_prompt().image
+    engine._vision_features(image, probe=None)
+
+    engine.model = CausalLMModel.from_directory(tiny_model_dir)
+    with pytest.raises(TypeError) as excinfo:
+        engine._vision_features(image, probe=None)
+    assert "vlm_config" in str(excinfo.value)

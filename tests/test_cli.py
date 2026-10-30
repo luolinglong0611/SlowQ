@@ -60,6 +60,38 @@ def interrupting_sampler(after: int, token_id: int = 7):
     return Interrupting
 
 
+def interrupting_requests(cancel: tuple[int, ...], token_id: int = 7, after: int = 1):
+    """A ``Sampler`` that interrupts only the listed requests, counting from zero.
+
+    ``Engine._stream`` builds one Sampler per request, so *which turn* gets
+    cancelled has to be tracked on the class — an instance counter restarts every
+    turn and cancels all of them. ``after`` draws succeed first, so the interrupted
+    turn has already run a decode step and committed a partial reply, which is the
+    state a real Ctrl-C leaves behind.
+    """
+
+    class Interrupting:
+        request = -1
+        calls = 0
+
+        def __init__(self, params=None) -> None:
+            self.params = params
+            type(self).request += 1
+            type(self).calls = 0
+
+        @property
+        def is_greedy(self) -> bool:
+            return True
+
+        def sample(self, logits) -> int:
+            type(self).calls += 1
+            if type(self).request in cancel and type(self).calls > after:
+                raise KeyboardInterrupt
+            return token_id
+
+    return Interrupting
+
+
 def prompt_token_counts(stderr: str) -> list[int]:
     """The ``prompt tokens`` value of every stats block, in order."""
     return [int(match) for match in re.findall(r"prompt tokens\s+(\d+)", stderr)]
@@ -457,6 +489,75 @@ def test_chat_ctrl_c_cancels_only_the_current_turn(run, feed, monkeypatch: pytes
     # The interrupted user turn is dropped, so nothing is listed as history.
     assert "user:" not in err[err.index("[cancelled]") :]
     assert "SlowQ>" in out
+
+
+def test_chat_ctrl_c_leaves_the_session_reusable(run, feed, monkeypatch: pytest.MonkeyPatch):
+    """Cancelling must not cost the conversation its cache.
+
+    The interrupted turn commits whatever decode steps it finished, and the
+    session records each one as the decoder makes it, so the next question still
+    matches the prefix that was really computed instead of starting cold.
+    """
+    monkeypatch.setattr("slowq.engine.Sampler", interrupting_requests(cancel=(0,)))
+    feed([PROMPT, PROMPT, "/exit"])
+    code, _, err = run(["chat", "--max-new-tokens", "4"])
+    assert code == 0
+    assert err.count("[cancelled]") == 1
+    after_cancel = err[err.index("[cancelled]") :]
+    # The retry asks the same question, so nearly all of it is already cached —
+    # including the partial reply the cancelled turn wrote, which the prefix match
+    # stops short of rather than trusting.
+    assert "cached (" in after_cancel
+
+
+def test_chat_announces_the_session_and_reports_reuse_per_turn(run, feed, answer):
+    feed([PROMPT, PROMPT, "/exit"])
+    code, _, err = run(["chat", "--max-new-tokens", "1"])
+    assert code == 0
+    assert "[session] KV reuse on" in err
+    # Turn one has nothing to reuse; turn two repeats the same question and finds
+    # most of it already in the cache. The stats row is indented, the banner is
+    # not, which is what tells them apart here.
+    reuse = [line for line in err.splitlines() if line.lstrip().startswith("KV reuse")]
+    assert len(reuse) == 1
+    assert "prefilled" in reuse[0]
+
+def test_chat_no_reuse_prefills_the_whole_history_every_turn(run, feed, answer):
+    feed([PROMPT, PROMPT, "/exit"])
+    code, _, err = run(["chat", "--max-new-tokens", "1", "--no-reuse"])
+    assert code == 0
+    assert "[session]" not in err
+    assert "KV reuse" not in err
+    assert "session cache" not in err
+
+
+def test_chat_reuse_and_no_reuse_give_the_same_answers(run, feed, answer):
+    """The point of --no-reuse is that it is a comparison, not a different mode."""
+    feed([PROMPT, PROMPT, "/exit"])
+    warm = run(["chat", "--max-new-tokens", "1"])
+    feed([PROMPT, PROMPT, "/exit"])
+    cold = run(["chat", "--max-new-tokens", "1", "--no-reuse"])
+    assert warm[0] == cold[0] == 0
+    assert warm[1] == cold[1]
+
+
+def test_chat_clear_drops_the_session_cache_too(run, feed, answer):
+    """/clear resets the text *and* the KV, or the next turn would reuse a prefix
+    of a conversation it is no longer having."""
+    feed([PROMPT, "/clear", PROMPT, "/exit"])
+    code, _, err = run(["chat", "--max-new-tokens", "1"])
+    assert code == 0
+    after_clear = err[err.index("[history cleared]") :]
+    assert "KV reuse" not in after_clear
+
+
+def test_chat_reports_how_much_of_the_conversation_is_cached(run, feed, answer):
+    feed([PROMPT, "/exit"])
+    _, _, err = run(["chat", "--max-new-tokens", "1"])
+    match = re.search(r"session cache\s+(\d+) tokens reusable after (\d+) turn", err)
+    assert match is not None
+    assert int(match.group(1)) > 0
+    assert int(match.group(2)) == 1
 
 
 def test_chat_quiet_suppresses_the_per_turn_stats(run, feed, answer):

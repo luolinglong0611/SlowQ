@@ -4,13 +4,15 @@ Two ways this tool can lie, both of which happened:
 
 * it timed a *single* full forward and printed ``chunks: 4`` next to it, so the
   report described a chunked prefill that never executed. The chunk count now
-  comes from counting calls to ``model.forward``, and both paths are measured.
+  comes from counting calls to ``model.encode`` and ``model.forward`` — both,
+  because a chunked prefill runs its non-final chunks through ``encode`` — and
+  both paths are measured.
 * it accepted ``--threads 4`` but not ``--threads=4``, so the second spelling
   exported nothing while the report went on to list the BLAS backend — reading
   like a measurement of a pin that was never applied.
 
-Everything here runs offline on the tiny model from ``conftest.py`` or on a
-recording stand-in; no real checkpoint is loaded.
+Everything here runs offline on the tiny model from ``conftest.py``; no real
+checkpoint is loaded.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from slowq import Engine
+from slowq.model import DecoderModel
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK = REPO_ROOT / "tools" / "benchmark.py"
@@ -106,10 +109,11 @@ def run_pre_import_probe(*argv: str) -> dict:
 
 
 class RecordingModel:
-    """Records forward calls instead of doing arithmetic.
+    """Records decoder-stack calls instead of doing arithmetic.
 
-    ``time_prefill`` only needs ``new_cache`` and ``forward``, so a stand-in is
-    enough to check *what was called* — which is exactly what the report claims.
+    Kept for the one property a real model cannot show cheaply: that the spy's
+    depth guard works. ``forward`` calls ``encode`` internally, so a chunk must
+    be counted once, not twice.
     """
 
     class Cache:
@@ -118,15 +122,20 @@ class RecordingModel:
             self.length = 0
 
     def __init__(self) -> None:
-        self.calls: list[list[int]] = []
+        self.calls: list[tuple[str, list[int]]] = []
 
     def new_cache(self, max_context: int) -> "RecordingModel.Cache":
         return self.Cache(max_context)
 
-    def forward(self, input_ids, cache, *args, **kwargs):
-        self.calls.append(list(input_ids))
+    def encode(self, input_ids, cache, *args, **kwargs):
+        self.calls.append(("encode", list(input_ids)))
         cache.length += len(input_ids)
         return None
+
+    def forward(self, input_ids, cache, *args, **kwargs):
+        self.calls.append(("forward", list(input_ids)))
+        self.encode(input_ids, cache)  # the real one does this too
+        return object()
 
 
 # --------------------------------------------------------------------------- #
@@ -229,31 +238,60 @@ def test_probe_token_ids_stay_inside_the_vocabulary(tool, vocab_size):
     assert ids == tool.probe_token_ids(64, vocab_size)  # deterministic
 
 
-def test_the_full_row_is_one_forward_over_the_whole_block(tool):
-    model = RecordingModel()
+def test_the_full_row_is_one_forward_over_the_whole_block(tool, tiny_model_dir: Path):
+    model = DecoderModel.from_directory(tiny_model_dir)
     row = tool.time_prefill(model, list(range(9)), None, mode="full")
     assert row["mode"] == "full"
     assert row["chunk_size"] is None
-    assert row["forwards"] == 1 == len(model.calls)
+    assert row["forwards"] == 1
     assert row["forward_token_counts"] == [9]
+    assert row["entry_points"] == ["forward"]
+    assert row["vocabulary_projections"] == 1
     assert row["cache_length"] == 9
 
 
-def test_the_chunked_row_runs_every_chunk_on_one_growing_cache(tool):
+def test_the_chunked_row_runs_every_chunk_on_one_growing_cache(
+    tool, tiny_model_dir: Path
+):
     """The chunk count is the number of calls, and the cache keeps growing.
 
-    Nine tokens at a chunk size of four is three forwards of 4/4/1 — an even
-    split would hide a loop that stopped early, and a fresh cache per chunk
-    would hide a loop that never appended.
+    Nine tokens at a chunk size of four is three decoder calls of 4/4/1 — an even
+    split would hide a loop that stopped early, and a fresh cache per chunk would
+    hide a loop that never appended.
     """
-    model = RecordingModel()
+    model = DecoderModel.from_directory(tiny_model_dir)
     row = tool.time_prefill(model, list(range(9)), 4, mode="chunked")
     assert row["mode"] == "chunked"
     assert row["chunk_size"] == 4
-    assert row["forwards"] == 3 == len(model.calls)
+    assert row["forwards"] == 3
     assert row["forward_token_counts"] == [4, 4, 1]
-    assert [len(call) for call in model.calls] == [4, 4, 1]
     assert row["cache_length"] == 9
+
+
+def test_only_the_last_chunk_projects_the_vocabulary(tool, tiny_model_dir: Path):
+    """The report has to show *which* entry point each chunk used.
+
+    ``forwards == 3`` alone cannot distinguish "three chunks, one projection"
+    from "three chunks, three projections", and the second is the thing this row
+    exists to rule out.
+    """
+    model = DecoderModel.from_directory(tiny_model_dir)
+    row = tool.time_prefill(model, list(range(9)), 4, mode="chunked")
+    assert row["entry_points"] == ["encode", "encode", "forward"]
+    assert row["vocabulary_projections"] == 1
+
+
+def test_the_spy_counts_one_chunk_once_even_though_forward_calls_encode(tool):
+    """``forward`` is ``encode`` plus a projection; the spy must not see two."""
+    model = RecordingModel()
+    with tool.ForwardSpy(model) as spy:
+        model.forward(list(range(9)), model.new_cache(16))
+    assert spy.token_counts == [9]
+    assert spy.entry_points == ["forward"]
+    assert spy.projections == 1
+    # The stand-in really did run both, so the single count is the depth guard
+    # and not a spy that stopped watching ``encode``.
+    assert [name for name, _ in model.calls] == ["forward", "encode"]
 
 
 def test_the_sweep_measures_both_paths_and_the_calls_are_cross_checked(
@@ -262,16 +300,23 @@ def test_the_sweep_measures_both_paths_and_the_calls_are_cross_checked(
     engine = Engine.from_directory(tiny_model_dir, max_context=64, prefill_chunk_size=3)
     monkeypatch.setattr(tool, "PREFILL_LENGTHS", (9,))
 
-    # An independent counter underneath the tool's own spy: if the report ever
-    # stopped reflecting real calls, these two lists would disagree.
-    seen: list[int] = []
+    # Independent counters underneath the tool's own spy: if the report ever
+    # stopped reflecting real calls, these lists would disagree.
+    forwards: list[int] = []
+    encodes: list[int] = []
     real_forward = engine.model.forward
+    real_encode = engine.model.encode
 
     def counting_forward(input_ids, cache, *args, **kwargs):
-        seen.append(len(input_ids))
+        forwards.append(len(input_ids))
         return real_forward(input_ids, cache, *args, **kwargs)
 
+    def counting_encode(input_ids, cache, *args, **kwargs):
+        encodes.append(len(input_ids))
+        return real_encode(input_ids, cache, *args, **kwargs)
+
     engine.model.forward = counting_forward
+    engine.model.encode = counting_encode
     rows = tool.measure_prefill_sweep(engine, max_length=64)
 
     assert [row["mode"] for row in rows] == ["full", "chunked"]
@@ -280,11 +325,16 @@ def test_the_sweep_measures_both_paths_and_the_calls_are_cross_checked(
     assert (chunked["forwards"], chunked["forward_token_counts"]) == (3, [3, 3, 3])
     assert chunked["chunk_size"] == 3
     assert full["cache_length"] == chunked["cache_length"] == 9
-    assert seen == [9, 3, 3, 3]
+    # ``forward`` is ``encode`` plus a projection, so every decoder call shows up
+    # in ``encodes``; ``forwards`` is only the ones that projected.
+    assert forwards == [9, 3]
+    assert encodes == [9, 3, 3, 3]
+    assert [row["vocabulary_projections"] for row in rows] == [1, 1]
     # The derived ``chunks`` field is what made the old report wrong; it is gone.
     assert all("chunks" not in row for row in rows)
     assert all(row["prefill_seconds"] > 0 for row in rows)
-    assert engine.model.forward is counting_forward  # the spy restored it
+    assert engine.model.forward is counting_forward  # the spy restored both
+    assert engine.model.encode is counting_encode
 
 
 def test_a_length_that_does_not_fit_the_budget_is_skipped_not_padded(

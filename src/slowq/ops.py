@@ -119,14 +119,102 @@ def sigmoid(x: np.ndarray) -> np.ndarray:
     ``1 / (1 + exp(-x))`` overflows to ``inf`` for x < -88 and NumPy then warns
     on every MLP call, so the two branches are evaluated separately. This is the
     same ``x * sigmoid(x)`` HF computes, just without the spurious overflow.
+
+    ``exp(-|x|)`` cannot overflow for any input, which lets both branches be
+    written over the whole array instead of over a boolean mask: for ``x >= 0``
+    the answer is ``1 / (1 + e)`` and for ``x < 0`` it is ``e / (1 + e)``, with
+    the same ``e``. Those are the same two expressions the masked form computes,
+    on the same values, so the result is bit-identical on every non-NaN element —
+    including at ``-0.0`` (where ``x >= 0`` holds, as it did before) and at
+    ``±inf``. NaN is the one exception, and it is an exception about *bit
+    patterns*, not values: both forms return NaN in the same positions, but
+    ``nan / nan`` can carry a different payload than ``exp(nan)`` did. Compare
+    with ``np.array_equal(..., equal_nan=True)`` for the values and byte-compare
+    only the non-NaN elements for the bitwise claim.
+
+    What it replaces matters for speed, not just clarity — but the number that
+    matters is not the operator's own speedup, and an earlier version of this
+    docstring said so wrongly. Four quantities are in play and they are not
+    interchangeable. Every figure below is a **range over every run preserved under
+    ``artifacts/*/sigmoid/``**, never a single run of
+    ``tools/perf/sigmoid_check.py`` (Qwen3-0.6B layer 0, 128-token prefill chunk,
+    median of 15 with 5 warmups, Apple Accelerate / NumPy 2.5.4):
+
+    1. **The operator alone**, old vs new on the captured activation: **3.90-4.35x
+       (about 4x)**.
+    2. **The sum of the layer's seven separately timed warm matmuls**, 3.17-3.36
+       ms. Dividing (1)'s old time by it yields **88-96%**, which is a ratio of two
+       unrelated measurements and must not be read as a share of anything: the
+       denominator has no softmax, no norms, no residual adds and no elementwise
+       work, so it is *not* a layer profile.
+    3. **A real forward with only ``silu`` changed.** Same layer, same weights,
+       same input tensor, same process, one cache object reused. This is the
+       attribution: the rewrite removes **44-47% of the real MLP** and **27-31% of
+       a real decoder layer** — attention, both norms and both residuals included.
+    4. **The end-to-end gain**, which lives in the A/B workload data and is not
+       measured here at all.
+
+    Quote (3), and quote it as a range. Quoting (1) as an MLP or layer gain
+    overstates it by however much of the layer is not sigmoid, which is most of
+    it. Note how wide (3)'s range is compared with its own repeatability: within a
+    run the 15 samples have stdev/median of 0.4-3.7%, yet the layer share differs
+    by more than 4 points between runs. **A tight spread inside one process says
+    nothing about how far two runs of the same probe can disagree** — which is why
+    this docstring quotes ranges and why the artifacts keep every sample.
+
+    The artifacts are in ``artifacts/perf-round1-rerun/sigmoid/`` (the four runs
+    behind the correction), ``artifacts/probe-rerun-20261028/sigmoid/`` and
+    ``artifacts/probe-rerun-20261029/sigmoid/`` (each the re-measurement owed after
+    the probe itself was edited — the first to refuse overwriting evidence, the
+    second to refuse it *before* the model load rather than after the measurement).
+    ``out_guard`` will not let a new run land in a directory an old one is
+    cited from, so one probe's artifacts accumulate across run roots rather than
+    inside one, and "the latest" is the newest by mtime across all of them — which is
+    how ``tests/test_perf_tooling.py`` finds it. Nothing is overwritten: within each
+    root ``sigmoid-check-run*.json`` are the earlier runs and ``sigmoid-check.json``
+    the last one taken there. Each records the probe's own hash and the
+    hashes of the sources it measured, in two forms — the raw file hash, and one
+    computed over the syntax tree with docstrings blanked out. The second is what
+    decides whether a re-measurement is owed, because the numbers above live in
+    ``ops.py``'s own prose: correcting that prose changes the raw hash without
+    changing anything the probe executed. ``tests/test_perf_tooling.py`` reads every
+    preserved run and fails if one falls outside the ranges quoted here, so those
+    ranges cannot rot silently. Two bands have been widened by that gate rather than
+    nudged by hand: the one-signed one 1.16 → 1.18, and the standard-normal one
+    7.6 → 7.7.
+
+    (1) depends strongly on where the input sits relative to zero, because the
+    masked form only pays for gather/scatter when both halves are non-empty: on
+    all-positive or all-negative input the two forms are within 1.06-1.18x of each
+    other, while synthetic standard-normal input gives 7.3-7.7x. Real gate
+    activations straddle zero — the captured activation from a real layer-0
+    forward has mean -0.546, std 0.668 and **84.5% of its values negative**. Those
+    three are not timings: every run reproduces them bit-for-bit, as it must,
+    being a function of the weights and the input ids. Two notes on that:
+
+    * The capture must come from a real forward. Recomputing it as
+      ``rms_norm(embed_tokens(ids), input_layernorm.weight) @ gate_proj.weight.T``
+      skips the whole attention block and the first residual, and uses
+      ``input_layernorm`` where the MLP is fed by ``post_attention_layernorm``.
+      That shortcut's output differs from the real activation by rel_l2 1.09 — the
+      error is larger than the signal. An earlier probe used it, and every figure
+      derived from it was withdrawn; the corrected numbers and the old ones are
+      both in ``docs/推理加速-第1轮-2026-10-23.md`` §2.4.
+    * The values straddle zero because that is what this model does, **not**
+      because RMSNorm centres anything. RMSNorm divides by the root mean square;
+      it never subtracts the mean. LayerNorm subtracts the mean. The captured
+      mean of -0.546 is the disproof, on the real tensor.
+
+    Reproduce all of it with ``tools/perf/sigmoid_check.py``, which captures the
+    activation by observing the shipped forward rather than by re-deriving it, and
+    which also checks bit equality on seven input families. Synthetic
+    distributions stay in that script, labelled as bounds on the operator's input
+    sensitivity — they are not measurements of this model.
     """
     x = as_f32(x)
-    out = np.empty_like(x)
-    positive = x >= 0
-    out[positive] = np.float32(1.0) / (np.float32(1.0) + np.exp(-x[positive], dtype=np.float32))
-    exp_negative = np.exp(x[~positive], dtype=np.float32)
-    out[~positive] = exp_negative / (np.float32(1.0) + exp_negative)
-    return out
+    exp_neg_abs = np.exp(-np.abs(x), dtype=np.float32)
+    denominator = exp_neg_abs + F32(1.0)
+    return np.where(x >= 0, F32(1.0) / denominator, exp_neg_abs / denominator)
 
 
 def silu(x: np.ndarray) -> np.ndarray:
@@ -136,7 +224,17 @@ def silu(x: np.ndarray) -> np.ndarray:
 
 
 def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
-    """Max-shifted softmax in FP32."""
+    """Max-shifted softmax in FP32.
+
+    Must not write into ``x``. ``group_query_attention`` returns these same
+    scores as its second value, documented as pre-softmax, so an in-place
+    exponential here would hand the caller probabilities under that name while
+    passing every numerical check.
+
+    Folding the three temporaries into one buffer was tried and measured: ±1%
+    against this version across decode- and prefill-shaped inputs, i.e. inside
+    the run-to-run spread. The allocations are not what this function costs.
+    """
     x = as_f32(x)
     shifted = x - np.max(x, axis=axis, keepdims=True)
     exponentiated = np.exp(shifted, dtype=np.float32)

@@ -28,7 +28,7 @@ Note there is no space after ``Query:``. That is what the model card's
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -113,6 +113,26 @@ def similarity_matrix(
     return np.matmul(left, right.T)
 
 
+def rank_documents(
+    query: np.ndarray, documents: Sequence[EmbeddingResult]
+) -> tuple[np.ndarray, list[tuple[int, float]]]:
+    """Score one query vector against encoded documents and rank them.
+
+    Shared by :meth:`EmbeddingEngine.search` and :meth:`DocumentIndex.search` so
+    that "the index gives a different answer than the plain search" is not a
+    possible failure mode: there is one implementation of the ranking, and the
+    only difference between the two entry points is where the document vectors
+    came from.
+    """
+    scores = similarity_matrix([query], [result.vector for result in documents])
+    ranking = sorted(
+        ((index, float(score)) for index, score in enumerate(scores[0])),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    return scores, ranking
+
+
 @dataclass(frozen=True)
 class EmbeddingResult:
     """One encoded text."""
@@ -139,6 +159,34 @@ class EmbeddingResult:
             "is_query": self.is_query,
             "encode_seconds": self.encode_seconds,
         }
+
+
+def detached(result: EmbeddingResult) -> EmbeddingResult:
+    """``result`` with its own copy of the vector, sharing no buffer with it.
+
+    ``EmbeddingResult`` is a frozen dataclass, and frozen freezes the *attribute
+    binding*, not the array it points at: ``result.vector`` cannot be reassigned,
+    but ``result.vector[:] = 0`` writes through happily. Anything that stores
+    results and later hands them back therefore has to say which side owns the
+    buffer, and :class:`DocumentIndex` answers by owning a private copy and
+    detaching on the way out — otherwise a caller zeroing one document's vector
+    silently re-scores the whole corpus for every later query, while
+    :meth:`EmbeddingEngine.search` (which re-encodes) still returns the original
+    answer. The scores keep looking like cosine similarities; they just stop
+    meaning anything, which is the worst shape this bug can take.
+
+    Only ``vector`` is copied. ``text`` and ``input_ids`` are a ``str`` and a
+    ``tuple`` — immutable, so sharing them is not aliasing — and the rest are
+    scalars.
+
+    The copy is the whole cost of the guarantee: ``hidden_size`` float32 per
+    document, so 4 MiB for a thousand Qwen3-Embedding-0.6B documents. That is
+    the same order as the two ``np.stack`` calls :func:`similarity_matrix`
+    already makes per search, and both are dwarfed by the query encode, which is
+    a full prefill. Measured rather than asserted in
+    ``tools/perf``'s index A/B, where the copy sits inside the timed window.
+    """
+    return replace(result, vector=np.array(result.vector, dtype=np.float32, copy=True))
 
 
 @dataclass(frozen=True)
@@ -373,21 +421,42 @@ class EmbeddingEngine:
         Returns the embeddings and the document indices ranked by descending
         cosine score. This is the whole of SlowQ's retrieval support; there is no
         vector store and no RAG pipeline behind it.
+
+        Every call re-encodes every document. For one query that is the honest
+        cost of the answer; for several queries against the same corpus it is
+        wasted work, and :meth:`index_documents` is what to use instead.
         """
         if not documents:
             raise UnsupportedInputError("search needs at least one document")
         encoded_query = self.encode_query(query, instruction=instruction)
         encoded_documents = [self.encode_document(text) for text in documents]
-        scores = similarity_matrix(
-            [encoded_query.vector], [result.vector for result in encoded_documents]
-        )
-        ranking = sorted(
-            ((index, float(score)) for index, score in enumerate(scores[0])),
-            key=lambda item: item[1],
-            reverse=True,
-        )
+        scores, ranking = rank_documents(encoded_query.vector, encoded_documents)
         batch = EmbeddingBatch(results=(encoded_query, *encoded_documents), similarity=scores)
         return batch, ranking
+
+    def index_documents(self, documents: Sequence[str]) -> "DocumentIndex":
+        """Encode a corpus once, then query it repeatedly.
+
+        ``search`` costs one encode per document per call, so N queries over M
+        documents cost N*M encodes where M would do. An index pays the M up front
+        and reduces each later query to a single encode plus a matrix multiply::
+
+            index = engine.index_documents(corpus)
+            batch, ranking = index.search("first question")
+            batch, ranking = index.search("second question")
+
+        The documents are encoded by exactly the same :meth:`encode_document`
+        ``search`` uses — verbatim, no instruction prefix — and the ranking comes
+        from the same :func:`rank_documents`, so ``index.search(q)`` and
+        ``engine.search(q, corpus)`` return the same vectors and the same order.
+        The index holds those vectors for as long as it is alive, which is the
+        trade being offered: memory in exchange for not recomputing.
+        """
+        if not documents:
+            raise UnsupportedInputError("index_documents needs at least one document")
+        with stopwatch() as elapsed:
+            results = tuple(self.encode_document(text) for text in documents)
+        return DocumentIndex(self, results, build_seconds=elapsed[0])
 
     # ---- internals ----------------------------------------------------------
 
@@ -419,3 +488,213 @@ class EmbeddingEngine:
                 "Raise --max-length if the checkpoint's positions allow it."
             )
         return input_ids
+
+
+class DocumentIndex:
+    """A corpus encoded once and queried many times.
+
+    Built by :meth:`EmbeddingEngine.index_documents`, which is where the
+    motivation lives. The vectors are held for as long as the index is, so a
+    thousand Qwen3-Embedding-0.6B documents cost about 4 MiB — against the
+    minutes of re-encoding that ``search`` would spend on every additional query.
+
+    Each :meth:`search` still encodes the query. That is deliberate: the query is
+    what varies between calls, and caching it too would turn a retrieval API into
+    a memo table whose hit rate depends on someone asking the same question twice.
+
+    Stale-index protection mirrors :class:`slowq.engine.Session`. The model, the
+    tokenizer and the encoding settings are recorded at build time and re-checked
+    before every search, so an engine that has since been reloaded or
+    reconfigured cannot silently score a fresh query against vectors a different
+    configuration produced. The scores would still look like cosine similarities;
+    they would just not mean anything.
+
+    **Vector ownership.** The index owns a private copy of every document vector
+    and detaches again on the way out, so :attr:`results` and :meth:`search` both
+    return arrays the caller may write to — the same semantics
+    :meth:`EmbeddingEngine.search` has, which is why the two stay
+    interchangeable. :func:`detached` explains what goes wrong without this:
+    ``EmbeddingResult`` is frozen, but frozen does not reach through to the
+    ``ndarray``, and an index that shared its buffers let a caller re-score the
+    corpus permanently.
+    """
+
+    #: Names for the entries of :meth:`_encoding_identity`, in order, so a changed
+    #: setting can be reported by name instead of as two opaque tuples.
+    _ENCODING_FIELDS = ("prefill_chunk_size", "weights")
+
+    def __init__(
+        self,
+        engine: EmbeddingEngine,
+        results: Sequence[EmbeddingResult],
+        *,
+        build_seconds: float = float("nan"),
+    ) -> None:
+        if not results:
+            raise UnsupportedInputError("a DocumentIndex needs at least one document")
+        self._engine = engine
+        self._model = engine.model
+        self._tokenizer = engine.tokenizer
+        self._encoding = self._encoding_identity(engine)
+        # Detached on the way in *and* on the way out, which is twice and not
+        # once by design: the caller of ``__init__`` may keep writing to the
+        # results it passed (that is route 1 of the leak), and the caller of
+        # ``results``/``search`` may keep writing to what it gets back (routes 2
+        # and 3). One copy at either end alone leaves the other route open.
+        self._results: tuple[EmbeddingResult, ...] = tuple(
+            detached(result) for result in results
+        )
+        #: Wall time of the encoding pass that built this index.
+        self.build_seconds = build_seconds
+        self._searches = 0
+
+    # ---- what is in it ------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self._results)
+
+    @property
+    def results(self) -> tuple[EmbeddingResult, ...]:
+        """The per-document results, in the order they were indexed.
+
+        Freshly detached on every access, so the vectors are **writable and owned
+        by the caller** — the same semantics :meth:`EmbeddingEngine.search` has,
+        which re-encodes and therefore also hands back arrays nobody else holds.
+        Writing to one changes nothing inside the index.
+        """
+        return tuple(detached(result) for result in self._results)
+
+    @property
+    def documents(self) -> tuple[str, ...]:
+        """The indexed texts, in order. ``results[i].text`` is the same string."""
+        return tuple(result.text for result in self._results)
+
+    @property
+    def vectors(self) -> np.ndarray:
+        """``[num_documents, hidden_size]``, freshly stacked on every access.
+
+        Stacked rather than stored so that the index never hands out a buffer it
+        also scores against: a caller that normalises or edits the array it gets
+        back changes only its own copy. Stacking a thousand unit vectors is
+        microseconds next to the encoding that produced them.
+        """
+        return np.stack([result.vector for result in self._results])
+
+    @property
+    def dimension(self) -> int:
+        return int(self._results[0].vector.shape[-1])
+
+    @property
+    def num_tokens(self) -> int:
+        """Tokens across the whole corpus — what one rebuild would re-prefill."""
+        return sum(result.num_tokens for result in self._results)
+
+    # ---- querying -----------------------------------------------------------
+
+    def search(
+        self,
+        query: str,
+        *,
+        instruction: str | None = DEFAULT_QUERY_INSTRUCTION,
+    ) -> tuple[EmbeddingBatch, list[tuple[int, float]]]:
+        """One query against the pre-encoded corpus.
+
+        Returns exactly what ``EmbeddingEngine.search(query, documents)`` returns:
+        an :class:`EmbeddingBatch` of ``(query, *documents)`` carrying the
+        similarity row, and the document indices ranked by descending cosine
+        score. Same shapes, same ranking function, same vectors — and, like that
+        method, arrays the caller owns and may write to without reaching the
+        index.
+
+        Scoring reads the internal buffers and only the returned batch is
+        detached, so the copy happens once per search rather than once per
+        document per comparison.
+        """
+        self._check_identity()
+        encoded_query = self._engine.encode_query(query, instruction=instruction)
+        scores, ranking = rank_documents(encoded_query.vector, self._results)
+        self._searches += 1
+        batch = EmbeddingBatch(
+            results=(encoded_query, *(detached(result) for result in self._results)),
+            similarity=scores,
+        )
+        return batch, ranking
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "documents": len(self._results),
+            "tokens": self.num_tokens,
+            "dimension": self.dimension,
+            "build_seconds": self.build_seconds,
+            "searches": self._searches,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"<DocumentIndex {len(self._results)} document(s), dim {self.dimension}, "
+            f"{self._searches} search(es)>"
+        )
+
+    # ---- staleness ----------------------------------------------------------
+
+    @staticmethod
+    def _encoding_identity(engine: EmbeddingEngine) -> tuple[Any, ...]:
+        """The settings a stored vector depends on, beyond model and tokenizer.
+
+        Two entries, and both are there because a stored vector really would
+        differ:
+
+        * ``prefill_chunk_size``, even though chunking is meant to be
+          transparent — it changes the order of the floating-point work in
+          :meth:`EmbeddingModel.encode_ids`, and the project's own
+          chunk-invariance tests allow a relative L2 difference of 2e-4 rather
+          than asserting bit-equality. Vectors that differ by that much are
+          still comparable, but they are not the vectors this index was built
+          from, and guessing which side moved is not worth the risk;
+        * the weight fingerprint, because the same engine pointed at a
+          re-converted or different checkpoint encodes to different numbers.
+
+        ``max_length`` is deliberately absent. It only bounds what gets
+        *refused*: no vector in this index was produced by a truncated encode,
+        since SlowQ raises :class:`ContextOverflowError` instead of truncating.
+        Raising the limit afterwards changes nothing about the stored numbers,
+        so refusing to search over it would be an annoyance with no correctness
+        behind it. ``model.dimension`` is absent for the same kind of reason —
+        a different dimension means a different model, which the identity check
+        in :meth:`_check_identity` already catches by name.
+
+        The tuple's order has to match :attr:`_ENCODING_FIELDS`, which is what
+        turns a changed entry into a readable error instead of two opaque ones.
+        """
+        return (
+            engine.prefill_chunk_size,
+            engine.model.weights.fingerprint(),
+        )
+
+    def _check_identity(self) -> None:
+        engine = self._engine
+        if engine.model is not self._model:
+            raise RuntimeError(
+                "the engine's model was replaced after this index was built, so "
+                "these vectors came from a different one. Build a new index."
+            )
+        if engine.tokenizer is not self._tokenizer:
+            raise RuntimeError(
+                "the engine's tokenizer was replaced after this index was built. "
+                "A query tokenised by the new one would be scored against "
+                "documents tokenised by the old one. Build a new index."
+            )
+        current = self._encoding_identity(engine)
+        if current != self._encoding:
+            changed = [
+                name
+                for name, before, after in zip(
+                    self._ENCODING_FIELDS, self._encoding, current
+                )
+                if before != after
+            ]
+            raise RuntimeError(
+                f"the engine's {' and '.join(changed)} changed after this index was "
+                "built, so a query encoded now is not comparable with the document "
+                "vectors it would be scored against. Build a new index."
+            )

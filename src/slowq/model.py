@@ -188,6 +188,33 @@ class ForwardResult:
     cache_length: int
 
 
+@dataclass(frozen=True)
+class PrefillResult:
+    """Output of a chunked prefill: one block of tokens, one vocabulary projection.
+
+    ``num_tokens`` counts the whole block, but ``hidden_states`` holds only the
+    **last chunk's** rows — earlier chunks were encoded, not projected, so their
+    final-normed states are not returned. ``logits`` is the distribution of the
+    block's last token, which is the only one generation samples from.
+
+    ``position_offset`` is where the block started, so a caller can recover the
+    absolute position of any row it does have: ``position_offset +
+    (num_tokens - hidden_states.shape[0]) + row``.
+    """
+
+    logits: np.ndarray
+    hidden_states: np.ndarray
+    position_offset: int
+    num_tokens: int
+    cache_length: int
+    chunks: int
+
+    @property
+    def hidden_states_offset(self) -> int:
+        """Absolute position of ``hidden_states[0]``."""
+        return self.position_offset + self.num_tokens - int(self.hidden_states.shape[0])
+
+
 class DecoderModel:
     """The family-generic text decoder over a converted weight directory.
 
@@ -295,7 +322,22 @@ class DecoderModel:
 
         positions = np.arange(offset, total_length, dtype=np.int64)
         cos, sin = rope_cos_sin(positions, self.inv_freq)
-        mask = causal_attention_mask(num_tokens, total_length, offset)
+        # A one-token forward's query sits at the last position, so its causal
+        # triangle already covers every cached key and ``causal_attention_mask``
+        # would return an all-zero ``[1, 1, 1, S]``. Adding zeros to the scores is
+        # a no-op in FP32, and the mask is built once here but consumed by every
+        # layer — skipping it removes ``num_hidden_layers`` broadcast adds of
+        # ``num_heads * S`` floats from each decoded token.
+        #
+        # Derived, not assumed: entry ``(i, j)`` is zero iff ``j <= offset + i``
+        # for all ``j < total_length == offset + num_tokens``, which reduces to
+        # ``num_tokens <= 1``. So this fires exactly on the single-token case and
+        # never on a chunk that still has a triangle of its own.
+        mask = (
+            None
+            if num_tokens == 1
+            else causal_attention_mask(num_tokens, total_length, offset)
+        )
 
         if probe is not None:
             # Checked up front: a bad position must be reported before the cache
@@ -364,6 +406,139 @@ class DecoderModel:
             cache_length=decoded.cache_length,
         )
 
+    def prefill(
+        self,
+        input_ids: Sequence[int] | np.ndarray,
+        kv_cache: KVCache,
+        *,
+        chunk_size: int,
+        probe: DebugProbe | None = None,
+        inputs_embeds: np.ndarray | None = None,
+        inputs_embed_mask: np.ndarray | None = None,
+        position_offset: int | None = None,
+    ) -> PrefillResult:
+        """Chunked prefill: encode every chunk, project the vocabulary once.
+
+        Generation samples from the last token only, so a 512-token prompt at
+        ``chunk_size=128`` needs one output projection rather than four.
+
+        The 593 MiB that ``lm_head`` occupies on Qwen3-0.6B invites an
+        overestimate of what skipping three of them buys, so here is the
+        measured figure instead. One projection is one *row* against that
+        weight, i.e. a single memory sweep of it: paired ``forward`` minus
+        ``encode`` over the same ids gives 5.57 ms at 512 tokens, and 4.49 /
+        8.37 ms at 128 / 256 — the cost does not depend on the block length, so
+        that spread is the probe's own precision, and 4-8 ms is the honest
+        range. Three skipped projections are then ~17 ms against a 1003.6 ms
+        baseline prefill, or **1.7%**: real work removed, but the same
+        magnitude as the cross-process spread this machine showed on the same
+        probe (3.0% on Qwen3-0.6B, 0.4% on SmolLM2-360M — two points, no
+        distribution, so there is no threshold to quote), and about 6% of what
+        the branchless ``sigmoid`` saves on the same prefill. The verdict is
+        therefore *not yet a confirmed gain or regression*, not "too small to
+        matter". This is kept because it is free and bit-identical, not because
+        it is measurable end to end.
+
+        The share tracks ``vocab_size * hidden_size``, not model quality: the
+        same probe reads 0.86 ms per projection on SmolLM2-135M (49152 x 576)
+        and 11.04 ms on Qwen3-1.7B (151936 x 2048). Reproduce with
+        ``tools/perf/projection_probe.py``.
+
+        The logits are bit-identical to running ``forward`` on every chunk and
+        keeping the last: the chunks are the same, they run in the same order
+        against the same cache, and ``forward`` *is* ``encode`` plus this one
+        projection. ``kv_cache.commit`` still happens once per chunk, inside
+        ``encode``, so the cache invariants are unchanged.
+
+        A probe that asked to observe ``logits`` keeps the old behaviour and
+        projects every chunk. Under chunking the last chunk's record already
+        overwrites the earlier ones, so what the probe reports does not change —
+        but a debug run is allowed to be slow and is not allowed to compute
+        something different.
+
+        ``inputs_embeds`` and ``inputs_embed_mask`` describe the **whole block**,
+        not one chunk. Image placeholder tokens can straddle a chunk boundary, so
+        the feature rows are handed out in prompt order as the chunks advance;
+        each chunk sees only the rows its own mask selects.
+
+        They are also validated as a whole block, before the first chunk runs.
+        That ordering is the point: :meth:`encode` commits K/V per chunk, so a
+        complaint raised inside chunk three of four leaves a cache four slots
+        longer than the tokens the caller accounted for, and a caller that
+        catches the error and keeps talking continues from slots nobody can
+        explain. The check is :meth:`_checked_inputs_embeds`, the same one
+        :meth:`forward` runs, which is why the two refuse the same input with the
+        same sentence.
+        """
+        ids = np.asarray(input_ids, dtype=np.int64).reshape(-1)
+        num_tokens = int(ids.shape[0])
+        if num_tokens == 0:
+            raise ValueError("prefill() needs at least one token")
+        if chunk_size < 1:
+            raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
+
+        offset = kv_cache.length if position_offset is None else int(position_offset)
+        features, mask = self._checked_inputs_embeds(
+            inputs_embeds, inputs_embed_mask, num_tokens, "this prefill"
+        )
+
+        project_every_chunk = probe is not None and probe.wants("logits")
+
+        decoded: DecoderOutput | None = None
+        logits: np.ndarray | None = None
+        feature_cursor = 0
+        chunks = 0
+        for start in range(0, num_tokens, chunk_size):
+            chunk = ids[start : start + chunk_size]
+            chunk_embeds = chunk_mask = None
+            if mask is not None:
+                chunk_mask = mask[start : start + len(chunk)]
+                take = int(chunk_mask.sum())
+                # ``take`` rows are guaranteed to be there: the block-level check
+                # above made the mask's total equal the row count, so the cursor
+                # walks the rows in prompt order and lands exactly on the end.
+                if take:
+                    chunk_embeds = features[feature_cursor : feature_cursor + take]
+                feature_cursor += take
+            chunk_offset = None if position_offset is None else offset + start
+            is_last = start + len(chunk) >= num_tokens
+            if is_last or project_every_chunk:
+                forward = self.forward(
+                    chunk,
+                    kv_cache,
+                    position_offset=chunk_offset,
+                    probe=probe,
+                    inputs_embeds=chunk_embeds,
+                    inputs_embed_mask=chunk_mask,
+                )
+                logits = forward.logits
+                decoded = DecoderOutput(
+                    hidden_states=forward.hidden_states,
+                    position_offset=forward.position_offset,
+                    num_tokens=forward.num_tokens,
+                    cache_length=forward.cache_length,
+                )
+            else:
+                decoded = self.encode(
+                    chunk,
+                    kv_cache,
+                    position_offset=chunk_offset,
+                    probe=probe,
+                    inputs_embeds=chunk_embeds,
+                    inputs_embed_mask=chunk_mask,
+                )
+            chunks += 1
+
+        assert decoded is not None and logits is not None  # the last chunk always projects
+        return PrefillResult(
+            logits=logits,
+            hidden_states=decoded.hidden_states,
+            position_offset=offset,
+            num_tokens=num_tokens,
+            cache_length=decoded.cache_length,
+            chunks=chunks,
+        )
+
     # ---- internals ----------------------------------------------------------
 
     def _merge_inputs_embeds(
@@ -378,23 +553,69 @@ class DecoderModel:
         The count is checked against the mask rather than trusted: a prompt whose
         ``<image>`` expansion disagrees with what the vision tower produced must
         fail here, loudly, instead of silently dropping image features or writing
-        them onto text tokens.
+        them onto text tokens. The rules themselves live in
+        :meth:`_checked_inputs_embeds`, which :meth:`prefill` runs over the whole
+        block before its first chunk, so the two entry points cannot drift.
         """
+        features, mask = self._checked_inputs_embeds(
+            inputs_embeds, inputs_embed_mask, num_tokens, "this forward"
+        )
+        if features is None:
+            return hidden
+        hidden = hidden.copy()
+        hidden[mask] = features
+        return hidden
+
+    def _checked_inputs_embeds(
+        self,
+        inputs_embeds: np.ndarray | None,
+        inputs_embed_mask: np.ndarray | None,
+        num_tokens: int,
+        where: str,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """One block's out-of-table embeddings, validated and normalised.
+
+        Returns ``(features, mask)`` with the dtypes and the reshape already
+        applied, or ``(None, mask)`` when there is nothing to merge. ``where`` is
+        the caller's own name for the block — "this forward", "this prefill" —
+        and appears only in the mask-length complaint, which is the one message
+        that reads better naming its entry point.
+
+        Every rule is a refusal rather than a repair, because each of them has a
+        silent alternative that looks like success:
+
+        * features with no mask cannot be placed anywhere, and guessing the
+          positions would write image rows onto text tokens;
+        * a mask whose length is not the block's would be broadcast or truncated
+          by NumPy into *some* answer;
+        * a row count that disagrees with the mask has no correct alignment, and
+          slicing ``features[:selected]`` — which is what a per-chunk cursor
+          effectively did — drops the rest without a word;
+        * a shape that is not ``[n, hidden_size]`` is not a sequence of
+          embeddings at all.
+
+        The mask is length-checked even when no features came with it. An
+        all-false mask of the wrong length is a caller bug that changes nothing
+        numerically, which is exactly why it would otherwise survive: the next
+        request would reuse the same wrong-length array with features attached.
+        """
+        mask: np.ndarray | None = None
+        if inputs_embed_mask is not None:
+            mask = np.asarray(inputs_embed_mask, dtype=bool).reshape(-1)
+            if mask.shape[0] != num_tokens:
+                raise ValueError(
+                    f"inputs_embed_mask covers {mask.shape[0]} positions but "
+                    f"{where} has {num_tokens} tokens"
+                )
         if inputs_embeds is None:
-            if inputs_embed_mask is not None and np.any(inputs_embed_mask):
+            if mask is not None and mask.any():
                 raise ValueError(
                     "inputs_embed_mask marks placeholder positions but no "
                     "inputs_embeds were supplied"
                 )
-            return hidden
-        if inputs_embed_mask is None:
+            return None, mask
+        if mask is None:
             raise ValueError("inputs_embeds require an inputs_embed_mask")
-        mask = np.asarray(inputs_embed_mask, dtype=bool).reshape(-1)
-        if mask.shape[0] != num_tokens:
-            raise ValueError(
-                f"inputs_embed_mask covers {mask.shape[0]} positions but this "
-                f"forward has {num_tokens} tokens"
-            )
         features = np.asarray(inputs_embeds, dtype=np.float32)
         if features.ndim != 2 or features.shape[1] != self.config.hidden_size:
             raise ValueError(
@@ -409,9 +630,7 @@ class DecoderModel:
                 "token count and the vision output disagree, so there is no "
                 "correct way to line them up"
             )
-        hidden = hidden.copy()
-        hidden[mask] = features
-        return hidden
+        return features, mask
 
     def _record_probe_logits(
         self, probe: DebugProbe, hidden: np.ndarray, last_logits: np.ndarray
@@ -444,7 +663,7 @@ class DecoderModel:
         kv_cache: KVCache,
         position_offset: int,
         total_length: int,
-        mask: np.ndarray,
+        mask: np.ndarray | None,
         probe: DebugProbe | None,
     ) -> np.ndarray:
         cfg = self.config
@@ -490,9 +709,14 @@ class DecoderModel:
         kv_cache: KVCache,
         position_offset: int,
         total_length: int,
-        mask: np.ndarray,
+        mask: np.ndarray | None,
     ) -> np.ndarray:
-        """``[T, hidden_size] -> [T, hidden_size]``; writes this layer's K/V."""
+        """``[T, hidden_size] -> [T, hidden_size]``; writes this layer's K/V.
+
+        ``mask`` is ``None`` when the caller knows the causal triangle is the whole
+        prefix — see :meth:`encode`. ``group_query_attention`` treats that as "no
+        masking", which is what an all-zero additive mask already meant.
+        """
         cfg = self.config
         num_tokens = x.shape[0]
         w = self.weights

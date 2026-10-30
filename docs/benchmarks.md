@@ -1,5 +1,12 @@
 # 性能与内存
 
+> **本文件是 v0.2 批次（2026-10-21）的历史基准，全部数字在推理加速第 1 轮之前测得。**
+> 第 1 轮改了 prefill 的词表投影、decode 的注意力路径，并新增了三处显式复用，
+> 所以下面的绝对值**不再描述当前代码**，只作为"优化前"的一侧存在。
+> 前后对照、命令与原始结果位置见[推理加速第 1 轮实测](推理加速-第1轮-2026-10-23.md)。
+> 两批数字**不能直接相减**：本文用 `tools/benchmark.py` 按工作负载测，
+> 第 1 轮用独立进程、固定 token IDs、两棵树相邻交替测。
+
 本文只记录**实测数据**。批次 `v0.2`，2026-10-21 在 macOS arm64 / Apple M5 Pro 上执行，
 每个模型跑在**独立进程**里，运行时机器上没有其他负载。结果只代表这组硬件、软件和运行条件。
 
@@ -17,13 +24,24 @@
 | 精度 / batch | FP32 / 1 |
 | 采样 | greedy（`temperature=0`） |
 
-生成模型的命令统一为：
+生成模型的命令统一为（**`--json` 请指向一个新目录**，理由见下）：
 
 ```bash
+OUT=$(.venv/bin/python tools/perf/out_guard.py fresh-root); echo "$OUT"
 python tools/benchmark.py --model models/<name>-slowq \
   --max-context 1024 --prefill-chunk-size 128 --decode-steps 32 --repeat 3 \
-  --json artifacts/benchmark/v0.2-<name>-slowq.json
+  --json "$OUT/v0.2-<name>-slowq.json"
 ```
+
+下面每一格的数字出自 `artifacts/benchmark/v0.2-*-slowq.json` 那 8 份**已发布**的
+测量结果。`tools/benchmark.py` 结尾是 `output.write_text(...)`，
+**没有接 `out_guard`，会静默覆盖 `--json` 指到的任何文件**——
+所以照着 `--json artifacts/benchmark/v0.2-<name>-slowq.json` 重跑一遍，
+就会把本文正在引用的那份原始证据原地换掉，而且换掉之后无法察觉。
+本轮（2026-10-28 问题 1）只给 `tools/perf/` 下的驱动与探针加了防覆盖，
+没有改 `tools/benchmark.py`：它不属于本轮四个问题，改它要跨目录引 `out_guard`。
+在那之前，**不覆盖已发布结果这件事由命令自己负责**——写到新目录去，
+需要对比时把两份并排读，不要就地重写。
 
 `tools/benchmark.py` 只支持文本生成（它用 `Engine.from_directory` 加载），
 向量与图文模型的数字来自各自引擎自己的计时字段，测法见[对应小节](#文本向量qwen3-embedding-06b)。
@@ -98,6 +116,12 @@ decode 探针测量短 prefill 之后的 32 次逐 token 前向加 greedy 选择
 
 32 token 时 chunked 与 full 相同（一个 chunk 就装下了）。128 token 之后分块的开销与收益
 都在几个百分点以内；512 token 时只有 Qwen3-1.7B 的分块比整块慢约 7%。
+**这一段的成因在第 1 轮之后已经变了。** 当时每个 chunk 都调 `forward()`，而 `forward()`
+只为最后一个位置做一次全词表投影（`model.py:398`），所以 4 个 chunk 里有 3 次投影是白算的；
+现在只有最后一个 chunk 投影（[架构说明 §5](architecture.md#5-分块-prefill)），
+分块与整块**投影次数相同（都是 1 次）**，剩下的差异只是每 chunk 的固定开销，
+分块不再因为多投影而落后，但也不会因此反超整块。
+表里的数字仍是当时实测的，第 1 轮的前后对照见[第 1 轮报告](推理加速-第1轮-2026-10-23.md)。
 **8 token 的 `full` 一行没有列进表里**：它是进程内的第一次前向，
 耗时被冷启动读权重支配（1.7 ~ 14.5 s），不能与后面的行比较，也不能用两者之差判断分块收益。
 
@@ -198,10 +222,19 @@ RSS 与权重体积的差额没有做逐页归因。
 ```python
 from slowq.vlm import VisionEngine
 engine = VisionEngine.from_directory("models/SmolVLM-256M-Instruct-slowq",
-                                     max_context=1024, prefill_chunk_size=128)
+                                     max_context=1024, prefill_chunk_size=128,
+                                     image_cache_bytes=0)            # 见下面的说明
 prompt = engine.build_prompt(image_path, question, system=system)   # 预处理 + prompt 扩展
 result = engine.generate_prompt(prompt, max_new_tokens=32)          # result.metrics
 ```
+
+**`image_cache_bytes=0` 是复现下表所必需的，不是可选项。** 本表测于第 1 轮之前，
+那时还没有图像特征缓存；现在 `generate_prompt` 经 `stream_prompt` 走缓存，
+而上面的写法只 `build_prompt` 一次、对同一个 `PreparedImage` 跑 3 轮，
+于是第 2、3 轮都是命中，**3 轮的中位数会是命中值（视觉编码约 16 ms 的哈希时间）
+而不是下表那个约 2400 ms 的视觉塔前向**。关掉缓存才能测到冷视觉塔；
+命中路径的数字在[第 1 轮报告](推理加速-第1轮-2026-10-23.md)里单列，
+缓存语义见[架构说明 §8.5](architecture.md#85-图像特征缓存imagefeaturecache)。
 
 两个样例的 `question` / `system` 沿用参考验证抓取里的两条（`samples.json`），
 **两者并不相同**，所以 prompt token 数不能只用 image token 数解释：
@@ -248,7 +281,10 @@ decode 从 grid-1x4 的 151.24 tok/s 降到 grid-2x4 的 140.23 tok/s，
 
 ## 在自己的机器上复现
 
-先按 [README](../README.md) 安装依赖并转换模型。生成模型：
+先按 [README](../README.md) 安装依赖并转换模型。生成模型
+（这两个 `local-*.json` 名字是给你自己的机器用的，**不要**把它们换成
+`v0.2-*-slowq.json`：那是本文引用的已发布结果，而 `tools/benchmark.py` 会静默覆盖，
+理由见本文开头「生成模型的命令」那一段）：
 
 ```bash
 python tools/benchmark.py --model models/Qwen3-0.6B-slowq \
@@ -281,6 +317,10 @@ python -m slowq vlm --model models/SmolVLM-256M-Instruct-slowq --json \
 把两张 PNG 生成出来，或者换成自己的图（那样 prompt token 数会与上表不同）。
 grid-2x4 一行换 `vision-grid-2x4.png`、`--question "What colours appear in this picture?"`
 且不带 `--system`。
+
+上面这条 `slowq vlm` 命令**不需要**任何额外开关就仍然测冷视觉塔：CLI 的两个图文入口
+都显式传 `image_cache_bytes=0`（一问一答即退出，缓存只会在没有任何后续请求会用到它
+的情况下白白付一次像素哈希）。需要缓存的是库路径，也就是本节开头那个 Python 片段。
 
 两条命令的 JSON 里分别有 `encode_seconds` 与完整的 `metrics`（含 `vision_encode_seconds`）。
 
