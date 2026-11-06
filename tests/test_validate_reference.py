@@ -1694,9 +1694,12 @@ def test_a_similarity_matrix_is_not_graded_by_a_next_token_argmax(
     """
     key = "retrieval-with-instruction.similarity"
     base = embedding_artifacts.arrays[key]
+    assert base.size >= 2
     top = int(np.argmax(base))
-    second = int(np.argsort(base.reshape(-1))[-2])
-    assert top != second
+    # Both selected entries are replaced below, so only distinct positions
+    # matter. Similarity diagonals tie at the maximum; argsort's default tie
+    # order can put argmax's first occurrence in the penultimate position too.
+    second = (top + 1) % base.size
 
     lead = np.float32(float(np.max(base)) + 1.0)
     trail = np.float32(lead - np.float32(1e-4))

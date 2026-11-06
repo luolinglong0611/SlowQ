@@ -31,7 +31,7 @@ extra and are used solely by ``tools/validate_reference.py``.
 
 from __future__ import annotations
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .cache import KVCache
 from .config import (

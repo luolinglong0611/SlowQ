@@ -1098,6 +1098,26 @@ def section_identity(line: list[str]) -> None:
     for _name, identity in found:
         representative.setdefault(identity.get("digest") or "<no digest>", identity)
 
+    relocated = sorted(
+        {
+            (str(Path(identity.get("root") or ROOT)), str(recorded_tree_root(identity)))
+            for _, identity in found
+            if recorded_tree_root(identity) != Path(identity.get("root") or ROOT)
+        }
+    )
+    if relocated:
+        line.append(
+            "**源码路径重定位**：以下历史绝对路径已不存在；根据记录的 "
+            "`tools/perf/` harness 所在仓库，保留被测树的仓库内相对位置，"
+            "在当前 checkout 核对。这里只重定位文件，不改写历史 JSON 或哈希，"
+            "下文仍逐文件比较；无法定位或内容不符的文件仍记为变化。\n"
+        )
+        line.append("| 记录的被测树路径 | 本次实际核对路径 |")
+        line.append("| --- | --- |")
+        for recorded, current in relocated:
+            line.append(f"| `{recorded}` | `{current}` |")
+        line.append("")
+
     def half(identity: dict[str, Any], key: str, label: str) -> tuple[str, list[str]]:
         matched, changed = recorded_map_still_matches(identity, key)
         total = len(identity.get(key) or {})
@@ -1397,6 +1417,45 @@ def partial_digest(identity: dict[str, Any], *keys: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def recorded_tree_root(identity: dict[str, Any]) -> Path:
+    """Locate a recorded tree after its entire checkout has moved.
+
+    Existing paths always win. For a missing absolute path, the recorded harness
+    must be directly inside ``tools/perf/`` of the old checkout, and the measured
+    tree must be that checkout or one of its descendants. Only then retain its
+    relative location under this checkout. A baseline stays a baseline snapshot;
+    it is never replaced by the current runtime merely because their names match.
+
+    Neither parent traversal nor a symlink out of the new checkout is a valid
+    relocation. This finds a candidate, not proof of identity: callers still hash
+    every recorded file, including files missing from the candidate.
+    """
+    recorded = Path(identity.get("root") or ROOT)
+    if recorded.exists() or not recorded.is_absolute() or ".." in recorded.parts:
+        return recorded
+    harness = identity.get("harness") or {}
+    if not isinstance(harness, dict) or not harness.get("path"):
+        return recorded
+    harness_path = Path(harness["path"])
+    if (
+        not harness_path.is_absolute()
+        or ".." in harness_path.parts
+        or harness_path.parent.name != "perf"
+        or harness_path.parent.parent.name != "tools"
+    ):
+        return recorded
+    old_checkout = harness_path.parent.parent.parent
+    try:
+        relative = recorded.relative_to(old_checkout)
+    except ValueError:
+        return recorded
+    checkout = ROOT.resolve()
+    candidate = (checkout / relative).resolve()
+    if not candidate.is_relative_to(checkout):
+        return recorded
+    return candidate
+
+
 def recorded_map_still_matches(identity: dict[str, Any], key: str) -> tuple[int, list[str]]:
     """``(matched, changed)`` for one recorded hash map — ``"source"`` or ``"tooling"``.
 
@@ -1406,16 +1465,24 @@ def recorded_map_still_matches(identity: dict[str, Any], key: str) -> tuple[int,
     and have to be reported separately: ``source`` is the code that was measured,
     ``tooling`` is the code that measured and renders it.
 
-    Paths resolve against the block's own ``root``: the baseline row describes a tree
-    materialised under ``artifacts/``, and hashing its relative paths against the
-    working tree would report every base-vs-opt difference as a file that "changed
-    since the run", which is the opposite of what the check is for.
+    Paths resolve against the block's own ``root``, or its location after a whole
+    checkout move as resolved by :func:`recorded_tree_root`. The baseline row
+    describes a tree materialised under ``artifacts/``; its relative position is
+    preserved rather than comparing it with the working tree's runtime.
     """
-    root = Path(identity.get("root") or ROOT)
+    root = recorded_tree_root(identity)
     matched = 0
     changed: list[str] = []
     for relative, recorded in sorted((identity.get(key) or {}).items()):
-        path = root / relative
+        relative_path = Path(relative)
+        path = root / relative_path
+        if (
+            relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or not path.resolve().is_relative_to(root.resolve())
+        ):
+            changed.append(relative)
+            continue
         if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == recorded:
             matched += 1
         else:

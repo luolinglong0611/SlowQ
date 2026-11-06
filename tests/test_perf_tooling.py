@@ -1165,7 +1165,8 @@ def test_the_bare_decode_probes_are_cross_checked_between_the_two_batches(
         base_drift = max(medians["ab"]["base"], medians["ab-longctx"]["base"]) / min(
             medians["ab"]["base"], medians["ab-longctx"]["base"]
         )
-        row = flat.split(f"|{short}|{re.sub(r'\s+', '', label)}|", 1)
+        compact_label = re.sub(r"\s+", "", label)
+        row = flat.split(f"|{short}|{compact_label}|", 1)
         assert len(row) == 2, f"{short} {label} has no row in the decode cross-check table"
         # Whitespace is already gone, so the row is bounded by the next row's leading
         # pipe: ``…|7/7|两批一致||SmolLM2-135M|…``. maxsplit=7 puts the verdict in
@@ -1354,6 +1355,136 @@ def _recorded_identity_blocks(report: Any, root: Path) -> list[tuple[str, dict]]
         if isinstance(identity, dict) and identity.get("digest"):
             blocks.append((name, identity))
     return blocks
+
+
+def test_recorded_trees_relocate_without_confusing_baseline_and_runtime(
+    report: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A moved checkout must retain each measured tree's relative location."""
+    old = tmp_path / "old checkout"
+    current = tmp_path / "new checkout"
+    monkeypatch.setattr(report, "ROOT", current)
+    data = current / "measurements"
+    data.mkdir(parents=True)
+    monkeypatch.setattr(report, "PERF", data)
+    monkeypatch.setattr(report, "IDENTITY_SOURCES", ["base.json", "opt.json"])
+    monkeypatch.setattr(report, "paired_directory", lambda: None)
+    relative_file = "src/slowq/model.py"
+    originals: dict[Path, bytes] = {}
+    for name, tree, content in (
+        ("base", Path("artifacts/baseline-tree"), b"baseline code"),
+        ("opt", Path("."), b"runtime code"),
+    ):
+        path = current / tree / relative_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        identity = {
+            "root": str(old / tree),
+            "harness": {"path": str(old / "tools/perf/core_ab.py")},
+            "source": {relative_file: hashlib.sha256(content).hexdigest()},
+            "tooling": {},
+        }
+        identity["digest"] = report.partial_digest(identity, "source", "tooling")
+        payload = data / f"{name}.json"
+        payload.write_text(json.dumps({"source_identity": identity}), encoding="utf-8")
+        originals[payload] = payload.read_bytes()
+        assert report.recorded_tree_root(identity) == current / tree
+        assert report.recorded_map_still_matches(identity, "source") == (1, [])
+
+    lines: list[str] = []
+    report.section_identity(lines)
+    rendered = "\n".join(lines)
+    assert "源码路径重定位" in rendered
+    assert f"| `{old}` | `{current}` |" in rendered
+    assert f"| `{old / 'artifacts/baseline-tree'}` | `{current / 'artifacts/baseline-tree'}` |" in rendered
+    assert "2/2 棵树的 digest 现在仍能原样复现" in rendered
+    assert all(path.read_bytes() == before for path, before in originals.items())
+
+
+def test_existing_recorded_tree_wins_over_a_matching_relocated_copy(
+    report: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Do not hide an edited original by selecting another matching copy."""
+    old, current = tmp_path / "old", tmp_path / "current"
+    old.mkdir()
+    current.mkdir()
+    (old / "file.py").write_bytes(b"changed")
+    (current / "file.py").write_bytes(b"recorded")
+    monkeypatch.setattr(report, "ROOT", current)
+    identity = {
+        "root": str(old),
+        "harness": {"path": str(old / "tools/perf/core_ab.py")},
+        "source": {"file.py": hashlib.sha256(b"recorded").hexdigest()},
+    }
+    assert report.recorded_tree_root(identity) == old
+    assert report.recorded_map_still_matches(identity, "source") == (0, ["file.py"])
+
+
+@pytest.mark.parametrize("content", [None, b"changed"])
+def test_relocated_tree_still_rejects_missing_or_changed_files(
+    report: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content: bytes | None
+) -> None:
+    old, current = tmp_path / "old", tmp_path / "current"
+    current.mkdir()
+    if content is not None:
+        (current / "file.py").write_bytes(content)
+    monkeypatch.setattr(report, "ROOT", current)
+    identity = {
+        "root": str(old),
+        "harness": {"path": str(old / "tools/perf/core_ab.py")},
+        "source": {"file.py": hashlib.sha256(b"recorded").hexdigest()},
+    }
+    assert report.recorded_tree_root(identity) == current
+    assert report.recorded_map_still_matches(identity, "source") == (0, ["file.py"])
+
+
+@pytest.mark.parametrize("case", ["external", "wrong-harness", "parent-root", "parent-harness", "symlink"])
+def test_recorded_tree_relocation_does_not_guess_or_escape_the_checkout(
+    report: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    old, current = tmp_path / "old", tmp_path / "current"
+    current.mkdir()
+    root = old
+    harness = old / "tools/perf/core_ab.py"
+    if case == "external":
+        root = tmp_path / "external-tree"
+    elif case == "wrong-harness":
+        harness = old / "unrelated/core_ab.py"
+    elif case == "parent-root":
+        root = old / ".." / "external-tree"
+    elif case == "parent-harness":
+        harness = old / ".." / "tools/perf/core_ab.py"
+    else:
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (current / "snapshot").symlink_to(outside, target_is_directory=True)
+        root = old / "snapshot"
+    monkeypatch.setattr(report, "ROOT", current)
+    identity = {"root": str(root), "harness": {"path": str(harness)}}
+    assert report.recorded_tree_root(identity) == root
+
+
+@pytest.mark.parametrize("case", ["parent", "absolute", "symlink"])
+def test_relocated_tree_hash_map_cannot_read_a_file_outside_its_root(
+    report: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    old, current = tmp_path / "old", tmp_path / "current"
+    current.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_bytes(b"recorded")
+    relative = "../outside.py"
+    if case == "absolute":
+        relative = str(outside)
+    elif case == "symlink":
+        relative = "link.py"
+        (current / relative).symlink_to(outside)
+    monkeypatch.setattr(report, "ROOT", current)
+    identity = {
+        "root": str(old),
+        "harness": {"path": str(old / "tools/perf/core_ab.py")},
+        "source": {relative: hashlib.sha256(b"recorded").hexdigest()},
+    }
+    assert report.recorded_map_still_matches(identity, "source") == (0, [relative])
 
 
 @ab_artifacts_missing

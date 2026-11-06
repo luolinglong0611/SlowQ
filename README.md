@@ -3,12 +3,16 @@
 > 用 CPU 慢慢炖出 token。
 
 SlowQ 是面向学习和实验的大模型推理框架，用 **Python + NumPy** 实现前向计算与生成流程，
-让每一步都能读懂。当前支持 **8 个模型、3 类任务**：文本生成、文本向量、图文生成。
+让每一步都能读懂。当前版本 **0.3.0**，支持 **8 个模型、3 类任务**：文本生成、文本向量、图文生成。
 
 支持 KV cache、分块 prefill、temperature / top-k / top-p 采样、流式输出和多轮聊天。
 运行时依赖只有 `numpy`、`tokenizers`、`Jinja2`，无需 PyTorch 或远程模型 API。
 
 ## 模型概览
+
+下表性能数字来自 **v0.2 接入批次（2026-10-21）**，用于说明模型规模，
+不是 v0.3.0 的性能承诺。后续加速的测量条件、收益与未确认项见
+[推理加速第 1 轮实测](docs/推理加速-第1轮-2026-10-23.md)。
 
 | 模型 | 任务 | 架构家族 | FP32 权重 | 实测（Apple M5 Pro） |
 | --- | --- | --- | --- | --- |
@@ -146,7 +150,7 @@ vision = VisionEngine.from_directory(model_dir, image_cache_bytes=0)   # 关掉
 
 ## 范围与限制
 
-- v0.2 为实验版：仅 CPU、FP32、batch size 1。
+- v0.3.0 为实验版：仅 CPU、FP32、batch size 1。
 - 面向代码阅读和推理实验；不提供量化、GPU 后端、并发服务、tool calling、训练与微调。
 - 图文生成一次请求只接受一张图，第二张会报错；一张图仍会按官方规则切成多个 crop。
 - 向量任务只提供向量输出、余弦相似度与一个**进程内、不落盘**的预编码索引
@@ -155,7 +159,9 @@ vision = VisionEngine.from_directory(model_dir, image_cache_bytes=0)   # 关掉
   会话自己分配一份满尺寸 KV cache，`max_context=2048` 的 Qwen3-0.6B 上约 448 MiB。
 - prompt 与预留生成长度之和超过 `max_context`、或文本超过 `max_length` 时会报错，不会自动截断。
 - Windows 和大端平台暂不支持。性能取决于 CPU、BLAS、线程数及上下文长度。
-- v0.2 的全部验证都在 macOS arm64 上执行；Linux x86_64 只有 v0.1 的 Qwen3-0.6B 记录。
+- 8 个模型的真实权重与参考数值验证记录来自 macOS arm64；Linux x86_64
+  仍只有 v0.1 的 Qwen3-0.6B 记录。macOS/Linux 的自动化快速测试使用微型模型，
+  不代表这 8 个 checkpoint 已在两种平台完成真实权重验证。
 
 ## 测试与文档
 
@@ -163,8 +169,14 @@ vision = VisionEngine.from_directory(model_dir, image_cache_bytes=0)   # 关掉
 
 ```bash
 python -m pip install -e ".[dev]"
-python -m pytest -m "not integration" -q     # 1042 passed, 62 deselected
+python -m pytest -m "not integration" -q
 ```
+
+完整覆盖图像读取还需安装 `python -m pip install -e ".[dev,vision]"`；
+未安装 Pillow 或缺少本地历史性能证据时，相应用例会明确跳过。
+[CI 工作流](.github/workflows/ci.yml) 在 macOS/Linux 上执行快速测试，
+并检查 wheel 的纯文本安装、视觉安装、命令行入口、版本一致性与依赖边界。
+当前验证范围、执行命令与按批次区分的历史结果见[测试与数值验证](docs/validation.md)。
 
 真实权重的集成测试用 `SLOWQ_MODEL_DIR=<转换后的目录> python -m pytest -m integration -q`。
 
@@ -172,7 +184,7 @@ python -m pytest -m "not integration" -q     # 1042 passed, 62 deselected
 - [架构说明](docs/architecture.md)：模块、前向流程、张量形状、KV cache 与三个任务的实现。
 - [测试与数值验证](docs/validation.md)：测试分层、参考验证协议、容差与实测结果。
 - [性能与内存](docs/benchmarks.md)：实测数据、测量条件与复现命令。
-- [变更记录](docs/changelog.md)：v0.2.0 与 v0.1.0。
+- [变更记录](docs/changelog.md)：v0.3.0、v0.2.0 与 v0.1.0。
 - [v0.2 多模型接入报告](docs/v0.2-多模型接入报告.md)：那一轮的设计决策、踩坑记录与未完成项。
 - [推理加速第 1 轮实测](docs/推理加速-第1轮-2026-10-23.md)：本轮五项改动省掉了什么、
   怎么验证正确性、A/B 实测数字与适用条件。

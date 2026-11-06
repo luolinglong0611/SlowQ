@@ -1,10 +1,11 @@
 # 模型支持
 
-SlowQ v0.2 支持 **8 个模型**、**3 类任务**：文本生成、文本向量、图文生成。
+SlowQ v0.3.0 支持 **8 个模型**、**3 类任务**：文本生成、文本向量、图文生成。
 本文记录每个模型的验证状态、来源版本、架构事实和复现命令。
 
 返回 [README](../README.md)；实现见[架构说明](architecture.md)；
-验证方法见[测试与数值验证](validation.md)；本轮改动见 [v0.2 接入报告](v0.2-多模型接入报告.md)。
+验证方法见[测试与数值验证](validation.md)；v0.3.0 改动见[变更记录](changelog.md)，
+模型最初接入的历史记录见 [v0.2 接入报告](v0.2-多模型接入报告.md)。
 
 ## 支持矩阵
 
@@ -35,9 +36,13 @@ SlowQ v0.2 支持 **8 个模型**、**3 类任务**：文本生成、文本向�
 Qwen3-0.6B 多出的 1 项是 v0.1 遗留的固定输出回归，它显式检查 checkpoint 来源是不是
 `Qwen/Qwen3-0.6B`，其他模型跳过并打印原因。
 
-**上表全部数字来自 2026-10-20 ~ 10-21 在 macOS arm64 / Apple M5 Pro 上的实际执行**，
-命令见[复现](#复现命令)。同一批代码在 Linux 上只跑过 v0.1 的 Qwen3-0.6B NumPy 侧，
-v0.2 新增的 7 个模型没有 Linux 验证记录。
+**上表全部数字来自 2026-10-20 ~ 10-21 的 v0.2 接入与修复批次，
+在 macOS arm64 / Apple M5 Pro 上实际执行**，命令见[复现](#复现命令)。
+v0.3.0 沿用这八个 checkpoint 的支持范围；后续推理加速的真实权重复验记录见
+[测试与数值验证](validation.md)，上表没有改写成发布时重新测量的结果。
+Linux 的历史真实模型记录只覆盖 v0.1 的 Qwen3-0.6B NumPy 侧；
+v0.2 新增的 7 个模型仍没有 Linux 真实权重验证记录。macOS / Linux 的无权重 CI
+不替代这一层真实模型验证。
 
 ## 来源与版本
 
@@ -63,10 +68,10 @@ manifest 仍是 `format_version: 1`、没有 `task` 与 `model_family` 两个键
 
 ### manifest format_version
 
-| 版本 | 写入者 | 是否带 `task` / `model_family` | v0.2 行为 |
+| 版本 | 写入者 | 是否带 `task` / `model_family` | v0.3.0 行为 |
 | --- | --- | --- | --- |
 | 1 | 只有 SlowQ v0.1 | 否 | 可读；`recorded_task()` 返回 `text-generation` |
-| 2 | SlowQ v0.2 | 是，两者都必须存在 | 可读，也是唯一会写出的版本 |
+| 2 | SlowQ v0.2 起 | 是，两者都必须存在 | 可读，也是唯一会写出的版本 |
 
 版本 1 的默认不是"猜"出来的：v0.1 只转换过 Qwen3 causal LM，所以缺键时的唯一可能取值就是
 文本生成。版本 2 缺任一键会被拒绝，其他版本号也会被拒绝，`Weights` 不会静默降级。
@@ -288,14 +293,16 @@ SmolVLM 的 prompt 展开后是 612 token，必须放大 `--max-context`，`--pr
 
 ## 已验证范围与未验证范围
 
-已验证：上表 8 个 checkpoint，在 macOS arm64 / Apple M5 Pro 上完成转换、离线加载、
-参考数值比较、功能集成测试与断网 CLI 检查。
+已验证：上表 8 个 checkpoint，在所注明的 macOS arm64 / Apple M5 Pro 历史批次中
+完成转换、离线加载、参考数值比较、功能集成测试与断网 CLI 检查。
+v0.3.0 的无权重 CI 检查代码与安装兼容性，不扩大这里的真实模型验证范围。
 
 未验证，因此**不能当作已支持**：
 
 - 这 8 个之外的任何模型，包括同家族的其他尺寸（例如 Qwen2.5-1.5B、SmolLM2-1.7B、Llama-3.2 系列）。
-- Base / 非 Instruct 变体。本轮只接了 Instruct 模型。
-- Linux 上的 v0.2 新模型（v0.1 的 Qwen3-0.6B 有 Linux 的 NumPy 侧记录，见[验证文档](validation.md)）。
+- 未列出的 Base / 非 Instruct 变体；支持范围以本页明确列出的八个 checkpoint 为准。
+- Linux 上的 v0.2 新模型真实权重验证（v0.1 的 Qwen3-0.6B 有 Linux 的 NumPy 侧记录，见[验证文档](validation.md)）。
 - 量化、GPU 后端、batch size > 1、并发服务、tool calling、训练与微调。
 - SmolVLM 的多图输入：一次请求只接受一张图，第二张会报错。
-- 向量检索的下游系统：只提供向量输出与余弦相似度示例，没有向量库或 RAG。
+- 向量检索的下游系统：已有向量输出、余弦相似度和进程内预编码索引，
+  没有持久化向量库或 RAG 管道。

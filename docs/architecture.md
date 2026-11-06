@@ -1,6 +1,6 @@
 # 慢炖 · SlowQ 架构说明
 
-本文描述 SlowQ v0.2 的实际实现：模块边界、两条正交的抽象轴（架构家族与任务类型）、
+本文描述 SlowQ v0.3.0 的实际实现：模块边界、两条正交的抽象轴（架构家族与任务类型）、
 一次请求的完整数据流、关键张量 shape、KV cache 语义、三个任务各自的前向路径、
 计时区间定义，以及依赖边界。所有内容对应仓库中真实存在的代码，不是设计意图。
 
@@ -8,16 +8,18 @@
 [测试与数值验证](validation.md) · [性能与内存](benchmarks.md) ·
 [变更记录](changelog.md) · [v0.2 接入报告](v0.2-多模型接入报告.md)
 
-文中标注为**历史批次**的测量结果属于当时的执行环境，不代表本轮重新跑过；
-本轮（2026-10-20 ~ 10-21）实际执行的数字都在[测试与数值验证](validation.md)、
-[性能与内存](benchmarks.md)与[模型支持](models.md)里。
+文中的测量结果按原始日期和执行环境保留，涉及“当前源码”“本轮”的测量叙述
+指各段所记录的历史批次，不代表 v0.3.0 发布时重新跑过。
+当前验证命令、CI 范围和本次结果以[测试与数值验证](validation.md#current-validation)
+为入口；历史性能与模型证据见[性能与内存](benchmarks.md)和[模型支持](models.md)。
 
 ---
 
 ## 1. 两条轴：family 与 task
 
 v0.1 只有一个模型，所以"模型是什么样"和"模型拿来做什么"是同一个问题的两个说法。
-v0.2 支持 8 个 checkpoint、3 类任务，这两件事必须拆开，否则每加一个模型就要在
+从 v0.2 起，支持范围扩展为 8 个 checkpoint、3 类任务；v0.3.0 沿用该范围。
+这两件事必须拆开，否则每加一个模型就要在
 前向代码里多一个 `if`：
 
 | 轴 | 回答什么 | 从哪里读 | 决定什么 |
@@ -1232,10 +1234,10 @@ uint16 → uint32 → << 16 → view(float32)
 `name/file/shape/dtype/source_dtype/source_name`，以及 `aliases`
 （`lm_head.weight → model.embed_tokens.weight`，tied embedding 只存一份）。
 
-| `format_version` | 写入者 | `task` / `model_family` | v0.2 行为 |
+| `format_version` | 写入者 | `task` / `model_family` | v0.3.0 行为 |
 | --- | --- | --- | --- |
 | 1 | 只有 SlowQ v0.1 | 必须**不存在** | 可读；task 按 v0.1 的唯一可能取值处理为 `text-generation` |
-| 2 | SlowQ v0.2 | 两者都**必须存在** | 可读，也是唯一会写出的版本 |
+| 2 | SlowQ v0.2 起 | 两者都**必须存在** | 可读，也是唯一会写出的版本 |
 
 版本 1 的默认不是"猜"：v0.1 只转换过 Qwen3 causal LM，所以缺键时的可能取值只有一个。
 版本 1 却带着这两个键会被拒绝（那意味着有人手工改过），其他版本号也被拒绝，
@@ -1419,6 +1421,22 @@ import 全部 14 个运行时模块后，`sys.modules` 共 268 个模块，其�
 
 ## 14. 测试分层
 
+### 14.1 当前入口（v0.3.0）
+
+macOS / Linux CI 运行不依赖真实权重的快速测试，并从 wheel 检查纯文本与带 `vision`
+两种干净安装。测试中构造的微型模型覆盖计算和接口约束；本地历史 `artifacts/`
+缺失时，相关用例说明原因并跳过。没有 Git 元数据的源码副本会跳过 Git 相关用例；
+Git checkout 则要求完整历史，CI 使用 `fetch-depth: 0`。CI 不下载模型，也不执行官方参考实现。
+
+真实模型集成由 `SLOWQ_MODEL_DIR` 显式启用，官方参考比较仍需单独准备真实权重与参考环境。
+当前命令、运行统计和 CI 覆盖边界集中在[测试与数值验证](validation.md#current-validation)，
+不要用下面的历史收集数判断当前测试是否完整。
+
+### 14.2 历史分层与收集数（截至 2026-10-28）
+
+本小节保留当时的审查证据。**1042 / 1104、各文件项数和“最终树”均属于该历史快照，
+不是 v0.3.0 当前数量**；相关原始记录见[历史快速测试记录](validation.md#historical-quick-tests)。
+
 ```
 默认（快速）   python -m pytest -m "not integration"
               1042 passed, 62 deselected，2026-10-28 在最终树上重复跑了多次，
@@ -1500,7 +1518,7 @@ import 全部 14 个运行时模块后，`sys.modules` 共 268 个模块，其�
 不能当成完整集成验证。8 个模型的逐项结果见[测试与数值验证](validation.md)。
 
 快速套件里五个文件是**工具层**的回归测试，不是模型层的：
-`test_perf_tooling.py`（**176**，新增文件，未进任何提交）、`test_validate_reference.py`（111）、
+`test_perf_tooling.py`（**176**，当时新增且尚未提交）、`test_validate_reference.py`（111）、
 `test_convert_model.py`（30）、`test_benchmark.py`（29）、`test_dependency_boundary.py`（6）。
 这五个收集数都在最终树上用 `--collect-only` 逐个重算过（2026-10-28），与本报告的 1042
 来自同一棵树：后四个自上一轮以来未变，`test_perf_tooling.py` 从 135 增到 176
@@ -1827,7 +1845,8 @@ torch 参考端往里装过 `transformers` / `safetensors` / `huggingface_hub`�
 通道装出的 torch 又因缺 `iJIT_NotifyEvent`（Intel ITT 符号）无法 import。
 所以"torch 自己在另一种 BLAS / 指令集下会不会算出别的数"仍未验证。
 
-**v0.2 新增的 7 个模型没有任何 Linux 记录。** 上表全部只覆盖 Qwen3-0.6B。
+**v0.2 新增的 7 个模型没有 Linux 真实权重验证记录。** 上表全部只覆盖 Qwen3-0.6B；
+v0.3.0 的 Linux 无权重测试另见[当前验证入口](validation.md#current-validation)。
 
 复现 Linux 侧只重算 NumPy 的那一步（不需要 torch）：
 

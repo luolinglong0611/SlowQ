@@ -1,21 +1,64 @@
 # 测试与参考验证
 
-本文说明 SlowQ v0.2 怎么验证：跑什么命令、比什么、门限是多少、实测结果如何。
+本文说明 SlowQ v0.3.0 怎么验证：跑什么命令、比什么、门限是多少、实测结果如何。
 所有命令从项目根目录执行。安装与模型下载需要网络；准备好依赖和本地模型后，
 测试与参考比较可以完全离线运行。
 
 返回 [README](../README.md)；模型清单与支持范围见[模型支持](models.md)；
 实现细节见[架构说明](architecture.md)。
 
-## 两层测试
+<a id="current-validation"></a>
 
-| 层 | 命令 | 需要网络 | 需要真实权重 | 数量 |
+## 当前验证入口（v0.3.0）
+
+| 层 | 命令或入口 | 执行范围 | 需要真实权重 | 证明什么 |
 | --- | --- | --- | --- | --- |
-| 快速测试 | `pytest -m "not integration"` | 否 | 否 | 1042 |
-| 真实模型集成 | `SLOWQ_MODEL_DIR=<dir> pytest -m integration` | 否 | 是 | 每模型收集 62，按任务过滤 |
+| 无权重自动测试 | `python -m pytest -m "not integration" -q` | macOS / Linux CI；本地也可运行 | 否 | 微型模型、工具与依赖边界的回归 |
+| 干净 wheel 安装 | `python tools/ci/check_wheel.py` | macOS / Linux；纯文本与带 `vision` 两种安装 | 否 | 构建产物可安装、CLI 可用、可选依赖边界正确 |
+| 真实模型集成 | `SLOWQ_MODEL_DIR=<dir> python -m pytest -m integration -q` | 显式运行，按 manifest 的任务过滤 | 是 | 指定 checkpoint 的真实权重功能与离线行为 |
+| 官方参考数值 | `validate_reference.py` 的 `numpy` → `ref` → `compare` | 显式准备模型与参考环境后运行 | 是 | NumPy 实现与固定官方参考的数值一致性 |
 
 快速测试用临时构造的微型模型和 tokenizer，覆盖算子、KV cache、采样、流式输出、
 config 家族规则、转换器、验证工具、性能工具与依赖边界。`.[dev]` 只增加 pytest，不安装 PyTorch。
+
+自动运行的定义见 [CI 工作流](../.github/workflows/ci.yml)：Ubuntu / macOS ×
+Python 3.11 / 3.15，运行源码快速测试和下面的 wheel 检查。
+工作流配置与实际执行结果分开记录；配置了某个平台不等于已获得该平台的通过记录。
+
+CI 从不含 `models/` 和本地 `artifacts/` 的源码开始。依赖本地历史性能证据的测试，
+在证据缺失时带原因跳过；没有 Git 元数据的源码副本会跳过相关 Git 用例。
+Git checkout 需要完整历史，以便验证记录中的基线 revision；CI 使用 `fetch-depth: 0`，
+浅 clone 中缺少所需 commit 不属于可自动跳过的情况。一般的工具回归和微型模型测试仍运行。
+因此，带本地证据的开发目录与干净源码副本的 passed / skipped 数可以不同，
+应同时记录命令、源码版本、可用证据和跳过原因，不能只比较 passed 数。
+
+**无权重 CI 通过不代表八个真实模型已经在 CI 上验证，也不代表 Linux 的真实模型支持矩阵
+已经补齐。** 真实权重与官方参考验证继续按下文协议独立执行；既有 macOS 结果和
+Linux v0.1 记录保留原始日期、平台与批次，不改写成 v0.3.0 新测结果。
+
+### v0.3.0 收尾验证（2026-11-07）
+
+以下为发布准备阶段的本地执行结果；后续 GitHub 托管 runner 的执行记录见
+[CI 运行列表](https://github.com/luolinglong0611/SlowQ/actions/workflows/ci.yml)。
+
+| 平台与 Python | 源码与证据条件 | 无权重快速测试 | 干净 wheel 检查 |
+| --- | --- | --- | --- |
+| macOS arm64 / 3.13.14 | 工作区保留历史 `artifacts/` | 1121 passed，62 deselected；38.03 s | 纯文本 / `vision` 两个新 venv 均 PASS |
+| Linux arm64 容器 / 3.11.18 | 普通用户；完整 Git clone；无 `models/`、`artifacts/` | 1076 passed，46 skipped，62 deselected；8.20 s | 纯文本 / `vision` 两个新 venv 均 PASS |
+| Linux arm64 容器 / 3.15.2 | 普通用户；完整 Git clone；无 `models/`、`artifacts/` | 1076 passed，46 skipped，62 deselected；8.84 s | 纯文本 / `vision` 两个新 venv 均 PASS |
+
+六个 wheel 安装环境的 `pip check` 均通过；工作流也通过官方 Docker 镜像的 `actionlint`
+检查（退出码 0）。Linux 在线安装曾遇到 PyPI 超时，最终用本轮下载的 wheel 缓存在
+断网容器和全新 venv 中完成同一 `check_wheel.py` 检查，校验内容没有改变。
+这些 Linux 结果来自 arm64 容器，不是 Linux x86_64 或 GitHub 托管 runner 的实跑记录。
+
+原始日志保存在本机 `artifacts/ci-v0.3.0-20261107/`，该目录被 Git 忽略、不随仓库分发：
+
+- macOS：`macos-python313-tests.log`、`macos-python313-wheel.log`。
+- Linux 测试及在线安装尝试：`linux-python311-tests-online-wheel-attempt.log`、
+  `linux-python315-tests-online-wheel-attempt.log`。
+- Linux 最终离线 wheel 检查：`linux-python311-wheel-offline.log`、
+  `linux-python315-wheel-offline.log`。
 
 ## 快速测试
 
@@ -25,7 +68,29 @@ python -m pip install -e ".[dev]"
 python -m pytest -m "not integration" -q
 ```
 
-**2026-10-28 二次审查修复后在同一台机器上的实际输出（当前树）：**
+图文相关快速测试使用 `python -m pip install -e ".[dev,vision]"` 安装 Pillow 后运行。
+纯文本环境必须仍能导入 `slowq.vlm`；只有实际读图时才需要 Pillow。
+干净 wheel 安装检查可在本地用同一个入口复现：
+
+```bash
+python tools/ci/check_wheel.py
+```
+
+[检查脚本](../tools/ci/check_wheel.py) 从当前源码建立临时干净构建目录，避免已有 `build/`
+混入 wheel；再创建纯文本与带 `vision` 的两个新环境，在 checkout 之外检查安装后的
+模块路径、包与 CLI 版本、依赖边界、各子命令帮助、Pillow 可选行为和 `pip check`。
+它不读取真实模型或历史性能产物；构建和安装依赖需要网络或预先准备的包缓存。
+这个检查验证交付的 wheel，与源码 editable 安装的测试互补。
+
+<a id="historical-quick-tests"></a>
+
+### 历史快速测试记录（2026-10-21—10-28）
+
+以下完整保留当时的计数、耗时、路径及审查过程。这里的“当前树”“最终树”“本轮”
+均指所标日期的源码快照，**1042 等计数不是 v0.3.0 当前测试数量**。
+后续新增测试及干净源码中因证据缺失而跳过的测试，应以当前验证入口和本次运行日志为准。
+
+**2026-10-28 二次审查修复后在同一台机器上的实际输出（当时的源码树）：**
 
 ```
 1042 passed, 62 deselected in 22.66s
@@ -1338,8 +1403,9 @@ macOS 参考抓取使用 PyTorch 2.14.1、Transformers 4.51.3、FP32 eager atten
 （SmolVLM 为 8）。v0.1 在 Linux 上重算的是 **SlowQ NumPy 侧**，比较对象是 macOS 抓取的固定参考，
 116 项通过，最差 `rel_l2=1.011e-05`、`max_abs=1.159e-04`；PyTorch 参考端没有在 Linux 重跑。
 
-**v0.2 新增的 7 个模型没有 Linux 验证记录。** 上表的 Linux 数字只覆盖 Qwen3-0.6B，
-不表示后续新增测试或新增模型在那里执行过。跨平台验证方法与那一轮的实测记录见
+**v0.2 新增的 7 个模型没有 Linux 真实权重验证记录。** 上表的 Linux 数字只覆盖 Qwen3-0.6B，
+不表示新增模型也在那里完成了真实权重验证；本版本的无权重测试另见
+[当前验证入口](#current-validation)。跨平台真实模型验证方法与那一轮的实测记录见
 [架构说明 · 历史批次记录](architecture.md#16-历史批次记录)。
 
 历史数字用于说明已验证的范围；当前改动是否通过，应以本地执行上述命令的结果为准。
